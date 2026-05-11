@@ -14,13 +14,14 @@ when you paste the merged output into another tool (LLM context, code review, et
 from __future__ import annotations
 
 import argparse
+import hashlib
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 
-def make_banner(path: Path, index: int, total: int, lines: int) -> str:
+def make_banner(path: Path, index: int, total: int, lines: int, sha: str) -> str:
     """Return a section header banner for a single file in the merged output."""
     bar = "=" * 72
     return (
@@ -28,6 +29,7 @@ def make_banner(path: Path, index: int, total: int, lines: int) -> str:
         f"# File {index} of {total}: {path.name}\n"
         f"# Path: {path}\n"
         f"# Lines: {lines:,}\n"
+        f"# SHA-256: {sha}\n"
         f"{bar}\n\n"
     )
 
@@ -48,14 +50,16 @@ def merge(files: list[Path], output: Path, no_banners: bool = False) -> None:
                 continue
 
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                data = path.read_bytes()
             except OSError as err:
                 print(f"  ⚠️  Read error on {path}: {err}", file=sys.stderr)
                 continue
+            text = data.decode("utf-8", errors="replace")
 
             if not no_banners:
                 line_count = len(text.splitlines())
-                banner = make_banner(path, index, total, line_count)
+                sha = hashlib.sha256(data).hexdigest()[:12]
+                banner = make_banner(path, index, total, line_count, sha)
                 out.write(banner)
                 written_bytes += len(banner.encode("utf-8"))
 

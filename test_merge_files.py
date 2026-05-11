@@ -34,29 +34,34 @@ class TestMakeBanner(unittest.TestCase):
     def test_contains_name_and_path(self):
         """Banner includes both the file name and full path."""
         path = Path("/srv/projects/foo/bar.py")
-        banner = merge_files.make_banner(path, 1, 3, 10)
+        banner = merge_files.make_banner(path, 1, 3, 10, "abc123def456")
         self.assertIn("bar.py", banner)
         self.assertIn(str(path), banner)
 
     def test_shows_index_and_total(self):
         """Banner shows the file's position as 'File N of M'."""
-        banner = merge_files.make_banner(Path("a.txt"), 2, 5, 0)
+        banner = merge_files.make_banner(Path("a.txt"), 2, 5, 0, "abc123def456")
         self.assertIn("File 2 of 5", banner)
 
     def test_has_bar_separators(self):
         """Banner is bounded by two horizontal '=' bars."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0)
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, "abc123def456")
         self.assertEqual(banner.count("=" * 72), 2)
 
     def test_ends_with_blank_line(self):
         """Banner ends with a blank line so content starts visually separated."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0)
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, "abc123def456")
         self.assertTrue(banner.endswith("\n\n"))
 
     def test_shows_line_count(self):
         """Banner includes the file's line count, comma-formatted."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 1234)
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 1234, "abc123def456")
         self.assertIn("Lines: 1,234", banner)
+
+    def test_shows_sha(self):
+        """Banner includes the SHA-256 fingerprint."""
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, "abc123def456")
+        self.assertIn("SHA-256: abc123def456", banner)
 
 
 class _MergeTestBase(unittest.TestCase):
@@ -138,6 +143,25 @@ class TestMergeHappyPath(_MergeTestBase):
         empty = self._write("empty.txt", "")
         result = self._merge([empty])
         self.assertIn("Lines: 0", result)
+
+    def test_banner_sha_matches_file_content(self):
+        """Banner SHA matches sha256(file_bytes)[:12] for the actual content."""
+        import hashlib
+        content = "hello\n"
+        first = self._write("a.txt", content)
+        expected_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        result = self._merge([first])
+        self.assertIn(f"SHA-256: {expected_sha}", result)
+
+    def test_banner_sha_differs_for_different_content(self):
+        """Different file contents produce different SHA fingerprints."""
+        first = self._write("a.txt", "alpha\n")
+        second = self._write("b.txt", "beta\n")
+        result = self._merge([first, second])
+        # Extract both SHA lines from the merged output.
+        sha_lines = [line for line in result.splitlines() if line.startswith("# SHA-256:")]
+        self.assertEqual(len(sha_lines), 2)
+        self.assertNotEqual(sha_lines[0], sha_lines[1])
 
 
 class TestMergeEdgeCases(_MergeTestBase):
