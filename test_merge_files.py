@@ -31,37 +31,47 @@ merge_files = _load_script()
 class TestMakeBanner(unittest.TestCase):
     """Banner formatting (`make_banner`)."""
 
+    # Dummy 64-char hex values for unit tests of the banner formatter itself.
+    # (make_banner doesn't validate length — that's enforced by merge().)
+    SHA = "a" * 64
+    SHA_NORM = "b" * 64
+
     def test_contains_name_and_path(self):
         """Banner includes both the file name and full path."""
         path = Path("/srv/projects/foo/bar.py")
-        banner = merge_files.make_banner(path, 1, 3, 10, "abc123def456")
+        banner = merge_files.make_banner(path, 1, 3, 10, self.SHA, self.SHA_NORM)
         self.assertIn("bar.py", banner)
         self.assertIn(str(path), banner)
 
     def test_shows_index_and_total(self):
         """Banner shows the file's position as 'File N of M'."""
-        banner = merge_files.make_banner(Path("a.txt"), 2, 5, 0, "abc123def456")
+        banner = merge_files.make_banner(Path("a.txt"), 2, 5, 0, self.SHA, self.SHA_NORM)
         self.assertIn("File 2 of 5", banner)
 
     def test_has_bar_separators(self):
         """Banner is bounded by two horizontal '=' bars."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, "abc123def456")
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
         self.assertEqual(banner.count("=" * 72), 2)
 
     def test_ends_with_blank_line(self):
         """Banner ends with a blank line so content starts visually separated."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, "abc123def456")
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
         self.assertTrue(banner.endswith("\n\n"))
 
     def test_shows_line_count(self):
         """Banner includes the file's line count, comma-formatted."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 1234, "abc123def456")
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 1234, self.SHA, self.SHA_NORM)
         self.assertIn("Lines: 1,234", banner)
 
     def test_shows_sha(self):
-        """Banner includes the SHA-256 fingerprint."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, "abc123def456")
-        self.assertIn("SHA-256: abc123def456", banner)
+        """Banner includes the raw SHA-256 fingerprint."""
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
+        self.assertIn(f"SHA-256: {self.SHA}", banner)
+
+    def test_shows_normalized_sha(self):
+        """Banner includes the normalized SHA-256 on its own line."""
+        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
+        self.assertIn(f"SHA-256-normalized: {self.SHA_NORM}", banner)
 
 
 class _MergeTestBase(unittest.TestCase):
@@ -145,23 +155,60 @@ class TestMergeHappyPath(_MergeTestBase):
         self.assertIn("Lines: 0", result)
 
     def test_banner_sha_matches_file_content(self):
-        """Banner SHA matches sha256(file_bytes)[:12] for the actual content."""
+        """Banner SHA matches the full SHA-256 hex of the file's raw bytes."""
         import hashlib
         content = "hello\n"
         first = self._write("a.txt", content)
-        expected_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        expected_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         result = self._merge([first])
+        self.assertEqual(len(expected_sha), 64)
         self.assertIn(f"SHA-256: {expected_sha}", result)
 
     def test_banner_sha_differs_for_different_content(self):
-        """Different file contents produce different SHA fingerprints."""
+        """Different file contents produce different raw SHA fingerprints."""
         first = self._write("a.txt", "alpha\n")
         second = self._write("b.txt", "beta\n")
         result = self._merge([first, second])
-        # Extract both SHA lines from the merged output.
-        sha_lines = [line for line in result.splitlines() if line.startswith("# SHA-256:")]
+        sha_lines = [
+            line for line in result.splitlines()
+            if line.startswith("# SHA-256:")
+        ]
         self.assertEqual(len(sha_lines), 2)
         self.assertNotEqual(sha_lines[0], sha_lines[1])
+
+    def test_banner_normalized_sha_matches_stripped_content(self):
+        """Normalized SHA matches sha256((text.strip() + '\\n').encode())."""
+        import hashlib
+        content = "  hello world  \n"
+        first = self._write("a.txt", content)
+        expected = hashlib.sha256((content.strip() + "\n").encode("utf-8")).hexdigest()
+        result = self._merge([first])
+        self.assertIn(f"SHA-256-normalized: {expected}", result)
+
+    def test_normalized_sha_equal_for_whitespace_only_differences(self):
+        """Files differing only in leading/trailing whitespace share a normalized SHA."""
+        bare = self._write("bare.txt", "hello world\n")
+        padded = self._write("padded.txt", "\n\n  hello world  \n\n")
+        result = self._merge([bare, padded])
+        normalized_lines = [
+            line for line in result.splitlines()
+            if line.startswith("# SHA-256-normalized:")
+        ]
+        self.assertEqual(len(normalized_lines), 2)
+        self.assertEqual(normalized_lines[0], normalized_lines[1])
+
+    def test_raw_sha_differs_for_whitespace_only_differences(self):
+        """The raw SHA still distinguishes whitespace-only variants — only the
+        normalized SHA collapses them."""
+        bare = self._write("bare.txt", "hello world\n")
+        padded = self._write("padded.txt", "\n\n  hello world  \n\n")
+        result = self._merge([bare, padded])
+        raw_lines = [
+            line for line in result.splitlines()
+            if line.startswith("# SHA-256:")
+        ]
+        self.assertEqual(len(raw_lines), 2)
+        self.assertNotEqual(raw_lines[0], raw_lines[1])
 
 
 class TestMergeEdgeCases(_MergeTestBase):

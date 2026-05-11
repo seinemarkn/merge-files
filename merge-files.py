@@ -21,8 +21,20 @@ from datetime import datetime
 from pathlib import Path
 
 
-def make_banner(path: Path, index: int, total: int, lines: int, sha: str) -> str:
-    """Return a section header banner for a single file in the merged output."""
+def make_banner(
+    path: Path,
+    index: int,
+    total: int,
+    lines: int,
+    sha: str,
+    sha_normalized: str,
+) -> str:
+    """Return a section header banner for a single file in the merged output.
+
+    `sha` is the full SHA-256 hex of the file's raw bytes.
+    `sha_normalized` is SHA-256 of (text.strip() + "\\n") — lets consumers
+    detect transcription that's correct modulo leading/trailing whitespace.
+    """
     bar = "=" * 72
     return (
         f"\n{bar}\n"
@@ -30,6 +42,7 @@ def make_banner(path: Path, index: int, total: int, lines: int, sha: str) -> str
         f"# Path: {path}\n"
         f"# Lines: {lines:,}\n"
         f"# SHA-256: {sha}\n"
+        f"# SHA-256-normalized: {sha_normalized}\n"
         f"{bar}\n\n"
     )
 
@@ -58,8 +71,12 @@ def merge(files: list[Path], output: Path, no_banners: bool = False) -> None:
 
             if not no_banners:
                 line_count = len(text.splitlines())
-                sha = hashlib.sha256(data).hexdigest()[:12]
-                banner = make_banner(path, index, total, line_count, sha)
+                sha = hashlib.sha256(data).hexdigest()
+                normalized_bytes = (text.strip() + "\n").encode("utf-8")
+                sha_normalized = hashlib.sha256(normalized_bytes).hexdigest()
+                banner = make_banner(
+                    path, index, total, line_count, sha, sha_normalized
+                )
                 out.write(banner)
                 written_bytes += len(banner.encode("utf-8"))
 
