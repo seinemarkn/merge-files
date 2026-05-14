@@ -1,0 +1,3 @@
+A hidden top-level file. SHOULD appear in the merged output — hidden
+entries are included so dot-prefixed project config (.env.example,
+.eslintrc, etc.) doesn't get dropped on the floor.

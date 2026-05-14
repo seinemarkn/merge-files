@@ -6,6 +6,12 @@ Usage:
     python merge_files.py file1.py file2.rb config.yml
     python merge_files.py src/*.py -o all_python.txt
     python merge_files.py a.md b.md c.md --no-banners
+    python merge_files.py my_project/        # whole folder, recursive
+
+Directory arguments are expanded recursively into their contained files
+(sorted alphabetically by path). Hidden entries (dot-prefixed) ARE included
+because they're often project config (.env.example, .eslintrc, .github/,
+etc.). Symlinks are skipped during expansion to avoid loops.
 
 Each file gets a header banner showing its name and path so sections are easy to spot
 when you paste the merged output into another tool (LLM context, code review, etc.).
@@ -15,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -45,6 +52,37 @@ def make_banner(
         f"# SHA-256-normalized: {sha_normalized}\n"
         f"{bar}\n\n"
     )
+
+
+def expand_paths(paths: list[Path]) -> list[Path]:
+    """Expand any directory entries in `paths` into their contained files.
+
+    Files are returned as-is, preserving the order in which they appear in
+    `paths`. Directories are walked recursively (depth-first); the files
+    discovered inside each directory are sorted alphabetically by path so the
+    output ordering is deterministic regardless of filesystem iteration order.
+
+    Hidden (dot-prefixed) files and directories ARE included — they're often
+    legitimate project config (.env.example, .eslintrc, .github/, etc.).
+    Symlinks are skipped during expansion to dodge cycles. A non-existent
+    path passed directly is left in the list so merge() can warn about it.
+    """
+    result: list[Path] = []
+    for p in paths:
+        if p.is_dir() and not p.is_symlink():
+            files_in_dir: list[Path] = []
+            for dirpath, dirnames, filenames in os.walk(p, followlinks=False):
+                dirnames.sort()
+                for fname in sorted(filenames):
+                    fpath = Path(dirpath) / fname
+                    if fpath.is_symlink():
+                        continue
+                    files_in_dir.append(fpath)
+            files_in_dir.sort()
+            result.extend(files_in_dir)
+        else:
+            result.append(p)
+    return result
 
 
 def merge(files: list[Path], output: Path, no_banners: bool = False) -> None:
@@ -97,7 +135,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Concatenate text/code/config files in order into one output file.",
     )
-    parser.add_argument("files", nargs="+", type=Path, help="Files to merge, in order.")
+    parser.add_argument(
+        "files",
+        nargs="+",
+        type=Path,
+        help=(
+            "Files and/or directories to merge, in order. Directories are "
+            "expanded recursively (alphabetically), including hidden "
+            "(dot-prefixed) entries; symlinks are skipped to avoid cycles."
+        ),
+    )
     parser.add_argument(
         "-o", "--output",
         type=Path,
@@ -123,8 +170,13 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Merging {len(args.files)} file(s) → {args.output}\n")
-    merge(files=args.files, output=args.output, no_banners=args.no_banners)
+    files = expand_paths(args.files)
+    if not files:
+        print("No files to merge (after expanding any folder arguments).", file=sys.stderr)
+        return 1
+
+    print(f"Merging {len(files)} file(s) → {args.output}\n")
+    merge(files=files, output=args.output, no_banners=args.no_banners)
 
     if sys.platform == "darwin":
         try:

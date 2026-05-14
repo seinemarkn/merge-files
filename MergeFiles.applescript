@@ -34,6 +34,6 @@ end open
 
 -- Double-clicking the .app (no files dropped) lands here.
 on run
-	display dialog "Drop one or more files onto MergeFiles.app to merge them." ¬
+	display dialog "Drop one or more files or folders onto MergeFiles.app to merge them. Folders are walked recursively, including hidden (dot-prefixed) entries." ¬
 		buttons {"OK"} default button "OK"
 end run

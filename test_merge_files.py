@@ -256,6 +256,131 @@ class TestMergeEdgeCases(_MergeTestBase):
         self.assertIn("Merged 1/2 file(s)", buf.getvalue())
 
 
+class TestExpandPaths(unittest.TestCase):
+    """Directory expansion (`expand_paths`)."""
+
+    def setUp(self):
+        """Allocate a per-test temp directory."""
+        self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def _touch(self, rel: str, content: str = "x\n") -> Path:
+        """Create a file at `rel` (relative to tmpdir) and any parent dirs."""
+        path = self.tmpdir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_plain_files_pass_through_unchanged(self):
+        """Non-directory paths are returned in the same order they came in."""
+        a = self._touch("a.txt")
+        b = self._touch("b.txt")
+        result = merge_files.expand_paths([a, b])
+        self.assertEqual(result, [a, b])
+
+    def test_flat_directory_expanded_alphabetically(self):
+        """A folder of files becomes a sorted list of those files."""
+        d = self.tmpdir / "flat"
+        d.mkdir()
+        c = self._touch("flat/c.txt")
+        a = self._touch("flat/a.txt")
+        b = self._touch("flat/b.txt")
+        result = merge_files.expand_paths([d])
+        self.assertEqual(result, [a, b, c])
+
+    def test_nested_directory_walked_recursively(self):
+        """Files in subdirectories are included, deterministically ordered."""
+        root = self.tmpdir / "proj"
+        root.mkdir()
+        top = self._touch("proj/top.txt")
+        deep = self._touch("proj/sub/deep.txt")
+        deeper = self._touch("proj/sub/inner/deeper.txt")
+        result = merge_files.expand_paths([root])
+        self.assertEqual(set(result), {top, deep, deeper})
+        # Sorted ⇒ shallower 'top.txt' comes after 'sub/...' lexicographically.
+        # The exact order isn't user-promised, but it must be deterministic.
+        self.assertEqual(result, sorted(result))
+
+    def test_hidden_files_in_directory_are_included(self):
+        """Dot-prefixed files inside a folder are included — they're often
+        project config (.env.example, .eslintrc, etc.)."""
+        d = self.tmpdir / "withhidden"
+        d.mkdir()
+        visible = self._touch("withhidden/visible.txt")
+        hidden = self._touch("withhidden/.env.example")
+        result = merge_files.expand_paths([d])
+        self.assertEqual(set(result), {visible, hidden})
+
+    def test_hidden_subdirectories_are_walked(self):
+        """Files inside hidden subtrees (.github/, .claude/, etc.) are merged
+        too — these often hold workflows, config, or agent definitions."""
+        root = self.tmpdir / "proj"
+        root.mkdir()
+        readme = self._touch("proj/README.md")
+        workflow = self._touch("proj/.github/workflows/ci.yml")
+        result = merge_files.expand_paths([root])
+        self.assertEqual(set(result), {readme, workflow})
+
+    def test_mixed_file_and_directory_args(self):
+        """File args and directory args coexist in the result in input order."""
+        loose = self._touch("loose.txt")
+        d = self.tmpdir / "bundle"
+        d.mkdir()
+        inside = self._touch("bundle/inside.txt")
+        result = merge_files.expand_paths([loose, d])
+        self.assertEqual(result, [loose, inside])
+
+    def test_empty_directory_contributes_nothing(self):
+        """An empty folder produces no entries and doesn't error."""
+        empty = self.tmpdir / "empty"
+        empty.mkdir()
+        other = self._touch("other.txt")
+        result = merge_files.expand_paths([empty, other])
+        self.assertEqual(result, [other])
+
+    def test_hidden_file_passed_directly_is_preserved(self):
+        """Filtering only applies during folder expansion: a user who
+        explicitly names a hidden file as an argument still gets it merged."""
+        hidden = self._touch(".env")
+        result = merge_files.expand_paths([hidden])
+        self.assertEqual(result, [hidden])
+
+    def test_nonexistent_path_is_preserved_for_merge_to_warn(self):
+        """Missing paths fall through unchanged so merge() can warn about them."""
+        missing = self.tmpdir / "does-not-exist"
+        result = merge_files.expand_paths([missing])
+        self.assertEqual(result, [missing])
+
+    def test_symlink_to_file_in_dir_is_skipped(self):
+        """Symlinks discovered during folder expansion are not included."""
+        d = self.tmpdir / "dir"
+        d.mkdir()
+        real = self._touch("dir/real.txt")
+        link = d / "link.txt"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks not supported on this filesystem")
+        result = merge_files.expand_paths([d])
+        self.assertEqual(result, [real])
+
+    def test_folder_drop_end_to_end_through_merge(self):
+        """Dropping a folder and feeding the expanded list through merge()
+        produces a banner per file inside the folder."""
+        d = self.tmpdir / "drop"
+        d.mkdir()
+        self._touch("drop/one.txt", "ONE\n")
+        self._touch("drop/two.txt", "TWO\n")
+        files = merge_files.expand_paths([d])
+        output = self.tmpdir / "out.txt"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            merge_files.merge(files=files, output=output)
+        result = output.read_text(encoding="utf-8")
+        self.assertIn("File 1 of 2", result)
+        self.assertIn("File 2 of 2", result)
+        self.assertIn("ONE", result)
+        self.assertIn("TWO", result)
+
+
 class TestMain(unittest.TestCase):
     """End-to-end tests for `main` — focused on output-path resolution."""
 

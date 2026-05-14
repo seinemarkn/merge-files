@@ -1,0 +1,7 @@
+name: merge-files-demo
+version: 1
+description: Sample config to show that non-.py files merge fine.
+features:
+  - banners
+  - sha256
+  - folder-drop
