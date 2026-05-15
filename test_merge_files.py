@@ -7,8 +7,10 @@ Run with:
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
+import re
 import sys
 import tempfile
 import unittest
@@ -17,10 +19,17 @@ from pathlib import Path
 
 
 def _load_script():
-    """Load merge-files.py as a module (hyphenated filename → importlib)."""
+    """Load merge-files.py as a module (hyphenated filename → importlib).
+
+    The sys.modules registration before exec_module is required: under Python
+    3.14, @dataclass walks sys.modules[cls.__module__] internally and crashes
+    if the host module isn't registered. The older importlib idiom worked only
+    because the file had no dataclasses.
+    """
     script_path = Path(__file__).parent / "merge-files.py"
     spec = importlib.util.spec_from_file_location("merge_files", script_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules["merge_files"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -28,102 +37,198 @@ def _load_script():
 merge_files = _load_script()
 
 
-class TestMakeBanner(unittest.TestCase):
-    """Banner formatting (`make_banner`)."""
+# Line-1 regex from the MERGE-FORMAT spec. Locked in: consumers parse it
+# unchanged whether the file is split or not. Reproduced here so the tests
+# fail loudly if the format ever drifts from the spec.
+BANNER_LINE1_RE = re.compile(
+    r"^=== \[(\d+)/(\d+)\] (.+) · (\d+) lines$"
+)
+BANNER_LINE2_WHOLE_RE = re.compile(
+    r"^=== sha=([a-f0-9]{64})  sha-norm=([a-f0-9]{64})$"
+)
+BANNER_LINE2_SPLIT_RE = re.compile(
+    r"^=== sha=([a-f0-9]{64})  part=(\d+)/(\d+)  range=(\d+)-(\d+)/(\d+)$"
+)
 
-    # Dummy 64-char hex values for unit tests of the banner formatter itself.
-    # (make_banner doesn't validate length — that's enforced by merge().)
+
+class TestMakeBanner(unittest.TestCase):
+    """2-line banner format for whole (unsplit) files."""
+
     SHA = "a" * 64
     SHA_NORM = "b" * 64
 
-    def test_contains_name_and_path(self):
-        """Banner includes both the file name and full path."""
-        path = Path("/srv/projects/foo/bar.py")
-        banner = merge_files.make_banner(path, 1, 3, 10, self.SHA, self.SHA_NORM)
-        self.assertIn("bar.py", banner)
-        self.assertIn(str(path), banner)
+    def _banner(self, **kw):
+        defaults = dict(
+            path=Path("/srv/projects/foo/bar.py"),
+            index=1, total=3, lines=10,
+            sha=self.SHA, sha_normalized=self.SHA_NORM,
+        )
+        defaults.update(kw)
+        return merge_files.make_banner(**defaults)
 
-    def test_shows_index_and_total(self):
-        """Banner shows the file's position as 'File N of M'."""
-        banner = merge_files.make_banner(Path("a.txt"), 2, 5, 0, self.SHA, self.SHA_NORM)
-        self.assertIn("File 2 of 5", banner)
+    def test_banner_is_exactly_two_lines(self):
+        """Output contract: every whole-file banner consumes exactly 2 lines."""
+        banner = self._banner()
+        # The banner string ends with \n, so splitlines gives the 2 lines.
+        self.assertEqual(len(banner.splitlines()), 2)
+        self.assertEqual(banner.count("\n"), 2)
 
-    def test_has_bar_separators(self):
-        """Banner is bounded by two horizontal '=' bars."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
-        self.assertEqual(banner.count("=" * 72), 2)
+    def test_line1_matches_spec_regex(self):
+        """Line 1 is parseable with the documented regex."""
+        line1 = self._banner().splitlines()[0]
+        m = BANNER_LINE1_RE.match(line1)
+        self.assertIsNotNone(m, f"Line 1 didn't match spec: {line1!r}")
 
-    def test_ends_with_blank_line(self):
-        """Banner ends with a blank line so content starts visually separated."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
-        self.assertTrue(banner.endswith("\n\n"))
+    def test_line1_carries_index_total_path_lines(self):
+        """Line 1 contains index, total, full path, and line count."""
+        line1 = self._banner(index=2, total=5, lines=42).splitlines()[0]
+        m = BANNER_LINE1_RE.match(line1)
+        assert m is not None
+        index, total, path, lines = m.groups()
+        self.assertEqual(index, "2")
+        self.assertEqual(total, "5")
+        self.assertEqual(path, "/srv/projects/foo/bar.py")
+        self.assertEqual(lines, "42")
 
-    def test_shows_line_count(self):
-        """Banner includes the file's line count, comma-formatted."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 1234, self.SHA, self.SHA_NORM)
-        self.assertIn("Lines: 1,234", banner)
+    def test_line2_carries_both_shas(self):
+        """Line 2 of a whole-file banner has sha= and sha-norm=."""
+        line2 = self._banner().splitlines()[1]
+        m = BANNER_LINE2_WHOLE_RE.match(line2)
+        self.assertIsNotNone(m, f"Line 2 didn't match spec: {line2!r}")
+        self.assertEqual(m.group(1), self.SHA)
+        self.assertEqual(m.group(2), self.SHA_NORM)
 
-    def test_shows_sha(self):
-        """Banner includes the raw SHA-256 fingerprint."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
-        self.assertIn(f"SHA-256: {self.SHA}", banner)
+    def test_no_trailing_blank_line(self):
+        """Banner does not emit a leading or trailing blank line — the next
+        banner / file content starts immediately on the next line."""
+        banner = self._banner()
+        self.assertFalse(banner.startswith("\n"))
+        self.assertFalse(banner.endswith("\n\n"))
+        self.assertTrue(banner.endswith("\n"))
 
-    def test_shows_normalized_sha(self):
-        """Banner includes the normalized SHA-256 on its own line."""
-        banner = merge_files.make_banner(Path("a.txt"), 1, 1, 0, self.SHA, self.SHA_NORM)
-        self.assertIn(f"SHA-256-normalized: {self.SHA_NORM}", banner)
+
+class TestMakeSplitBanner(unittest.TestCase):
+    """2-line banner format for one chunk of a split file."""
+
+    SHA = "c" * 64
+
+    def _banner(self, **kw):
+        defaults = dict(
+            path=Path("/srv/big.py"),
+            index=12, total=80, chunk_lines=4998,
+            sha=self.SHA, part_n=2, part_total=3,
+            range_start=5001, range_end=9998, file_total_lines=15000,
+        )
+        defaults.update(kw)
+        return merge_files.make_split_banner(**defaults)
+
+    def test_banner_is_exactly_two_lines(self):
+        """Output contract: every split-chunk banner consumes exactly 2 lines."""
+        banner = self._banner()
+        self.assertEqual(len(banner.splitlines()), 2)
+        self.assertEqual(banner.count("\n"), 2)
+
+    def test_line1_matches_same_regex_as_whole_file(self):
+        """Line 1's shape is identical for split and unsplit — consumers can
+        parse it with one regex regardless."""
+        line1 = self._banner().splitlines()[0]
+        m = BANNER_LINE1_RE.match(line1)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(4), "4998")  # chunk's own line count
+
+    def test_line2_omits_sha_norm_and_carries_part_and_range(self):
+        """Line 2 of a split chunk: sha + part= + range= (no sha-norm)."""
+        line2 = self._banner().splitlines()[1]
+        m = BANNER_LINE2_SPLIT_RE.match(line2)
+        self.assertIsNotNone(m, f"Line 2 didn't match split spec: {line2!r}")
+        sha, part_n, part_total, r_start, r_end, file_total = m.groups()
+        self.assertEqual(sha, self.SHA)
+        self.assertEqual(part_n, "2")
+        self.assertEqual(part_total, "3")
+        self.assertEqual(r_start, "5001")
+        self.assertEqual(r_end, "9998")
+        self.assertEqual(file_total, "15000")
+        self.assertNotIn("sha-norm=", line2)
+
+    def test_lines_equals_range_width_invariant(self):
+        """Invariant: line-1 `K lines` == range_end - range_start + 1."""
+        banner = self._banner(chunk_lines=4998, range_start=5001, range_end=9998)
+        line1, line2 = banner.splitlines()
+        m1 = BANNER_LINE1_RE.match(line1)
+        m2 = BANNER_LINE2_SPLIT_RE.match(line2)
+        assert m1 is not None and m2 is not None
+        chunk_lines = int(m1.group(4))
+        a = int(m2.group(4))
+        b = int(m2.group(5))
+        self.assertEqual(chunk_lines, b - a + 1)
 
 
 class _MergeTestBase(unittest.TestCase):
-    """Shared scaffolding: an isolated temp dir + helpers for the merge tests."""
+    """Shared scaffolding: an isolated temp dir + helpers for merge() tests."""
+
+    # Default cap big enough that merge() never splits — keeps the legacy
+    # tests focused on single-file output behavior.
+    HUGE_CAP = 10 ** 9
 
     def setUp(self):
-        """Allocate a per-test temp directory via the unittest context stack."""
         self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.output = self.tmpdir / "out.txt"
 
     def _write(self, name: str, content: str) -> Path:
-        """Write `content` to `name` inside the test's temp directory."""
         path = self.tmpdir / name
         path.write_text(content, encoding="utf-8")
         return path
 
-    def _merge(self, files, no_banners=False):
-        """Run merge() with stdout/stderr suppressed and return the output text."""
+    def _merge(self, files, no_banners=False, max_lines=None) -> str:
+        """Run merge(), expecting a single output file, return its text."""
+        if max_lines is None:
+            max_lines = self.HUGE_CAP
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            merge_files.merge(files=files, output=self.output, no_banners=no_banners)
-        return self.output.read_text(encoding="utf-8")
+            written = merge_files.merge(
+                files=files,
+                output_base=self.output,
+                max_lines=max_lines,
+                no_banners=no_banners,
+            )
+        self.assertEqual(len(written), 1,
+                         f"expected single output file, got {written}")
+        return written[0].read_text(encoding="utf-8")
+
+    def _merge_paths(self, files, max_lines) -> list[Path]:
+        """Run merge() and return the list of written paths (multi-file OK)."""
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return merge_files.merge(
+                files=files,
+                output_base=self.output,
+                max_lines=max_lines,
+            )
 
 
 class TestMergeHappyPath(_MergeTestBase):
-    """Normal-case behavior of `merge`."""
+    """Normal-case behavior of `merge` with the new 2-line banner."""
 
     def test_concatenates_two_files_in_order(self):
-        """Output preserves input ordering of file contents."""
         first = self._write("a.txt", "alpha\n")
         second = self._write("b.txt", "beta\n")
         result = self._merge([first, second])
         self.assertLess(result.index("alpha"), result.index("beta"))
 
     def test_banners_included_by_default(self):
-        """Each file gets a header banner with its index/total and name."""
         first = self._write("a.txt", "alpha\n")
         result = self._merge([first])
-        self.assertIn("File 1 of 1", result)
-        self.assertIn("a.txt", result)
+        self.assertIn("[1/1]", result)
+        self.assertIn(str(first), result)
 
     def test_no_banners_flag_omits_banners(self):
-        """`no_banners=True` produces plain concatenation with no headers."""
         first = self._write("a.txt", "alpha\n")
         second = self._write("b.txt", "beta\n")
         result = self._merge([first, second], no_banners=True)
-        self.assertNotIn("File 1 of 2", result)
-        self.assertNotIn("=" * 72, result)
+        self.assertNotIn("[1/2]", result)
+        self.assertNotIn("===", result)
         self.assertEqual(result, "alpha\nbeta\n")
 
     def test_adds_trailing_newline_when_missing(self):
-        """A file without a trailing newline gets one appended so the next
-        banner doesn't get glued to the prior file's last line."""
+        """File without trailing \\n gets one so the next banner starts on a new line."""
         first = self._write("a.txt", "no-newline")
         second = self._write("b.txt", "beta\n")
         result = self._merge([first, second])
@@ -131,120 +236,97 @@ class TestMergeHappyPath(_MergeTestBase):
         self.assertEqual(result[idx + len("no-newline")], "\n")
 
     def test_preserves_existing_trailing_newline(self):
-        """A file that already ends in '\\n' is not double-terminated."""
         first = self._write("a.txt", "alpha\n")
         result = self._merge([first], no_banners=True)
         self.assertEqual(result, "alpha\n")
 
-    def test_banner_includes_line_count(self):
-        """Banner reports the correct number of lines for the file."""
+    def test_banner_line_count(self):
         first = self._write("a.txt", "one\ntwo\nthree\n")
         result = self._merge([first])
-        self.assertIn("Lines: 3", result)
+        self.assertIn("· 3 lines", result)
 
     def test_banner_line_count_handles_missing_trailing_newline(self):
-        """Final line without a trailing newline still counts as a line."""
         first = self._write("a.txt", "one\ntwo\nthree")
         result = self._merge([first])
-        self.assertIn("Lines: 3", result)
+        self.assertIn("· 3 lines", result)
 
     def test_banner_line_count_for_empty_file(self):
-        """Empty file reports 0 lines."""
         empty = self._write("empty.txt", "")
         result = self._merge([empty])
-        self.assertIn("Lines: 0", result)
+        self.assertIn("· 0 lines", result)
 
     def test_banner_sha_matches_file_content(self):
-        """Banner SHA matches the full SHA-256 hex of the file's raw bytes."""
-        import hashlib
         content = "hello\n"
         first = self._write("a.txt", content)
         expected_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         result = self._merge([first])
-        self.assertEqual(len(expected_sha), 64)
-        self.assertIn(f"SHA-256: {expected_sha}", result)
+        self.assertIn(f"sha={expected_sha}", result)
 
     def test_banner_sha_differs_for_different_content(self):
-        """Different file contents produce different raw SHA fingerprints."""
         first = self._write("a.txt", "alpha\n")
         second = self._write("b.txt", "beta\n")
         result = self._merge([first, second])
-        sha_lines = [
-            line for line in result.splitlines()
-            if line.startswith("# SHA-256:")
-        ]
-        self.assertEqual(len(sha_lines), 2)
-        self.assertNotEqual(sha_lines[0], sha_lines[1])
+        shas = re.findall(r"sha=([a-f0-9]{64})  sha-norm=", result)
+        self.assertEqual(len(shas), 2)
+        self.assertNotEqual(shas[0], shas[1])
 
-    def test_banner_normalized_sha_matches_stripped_content(self):
-        """Normalized SHA matches sha256((text.strip() + '\\n').encode())."""
-        import hashlib
+    def test_banner_normalized_sha(self):
         content = "  hello world  \n"
         first = self._write("a.txt", content)
         expected = hashlib.sha256((content.strip() + "\n").encode("utf-8")).hexdigest()
         result = self._merge([first])
-        self.assertIn(f"SHA-256-normalized: {expected}", result)
+        self.assertIn(f"sha-norm={expected}", result)
 
     def test_normalized_sha_equal_for_whitespace_only_differences(self):
-        """Files differing only in leading/trailing whitespace share a normalized SHA."""
         bare = self._write("bare.txt", "hello world\n")
         padded = self._write("padded.txt", "\n\n  hello world  \n\n")
         result = self._merge([bare, padded])
-        normalized_lines = [
-            line for line in result.splitlines()
-            if line.startswith("# SHA-256-normalized:")
-        ]
-        self.assertEqual(len(normalized_lines), 2)
-        self.assertEqual(normalized_lines[0], normalized_lines[1])
+        norms = re.findall(r"sha-norm=([a-f0-9]{64})", result)
+        self.assertEqual(len(norms), 2)
+        self.assertEqual(norms[0], norms[1])
 
     def test_raw_sha_differs_for_whitespace_only_differences(self):
-        """The raw SHA still distinguishes whitespace-only variants — only the
-        normalized SHA collapses them."""
         bare = self._write("bare.txt", "hello world\n")
         padded = self._write("padded.txt", "\n\n  hello world  \n\n")
         result = self._merge([bare, padded])
-        raw_lines = [
-            line for line in result.splitlines()
-            if line.startswith("# SHA-256:")
-        ]
-        self.assertEqual(len(raw_lines), 2)
-        self.assertNotEqual(raw_lines[0], raw_lines[1])
+        raws = re.findall(r"sha=([a-f0-9]{64})  sha-norm=", result)
+        self.assertEqual(len(raws), 2)
+        self.assertNotEqual(raws[0], raws[1])
 
 
 class TestMergeEdgeCases(_MergeTestBase):
-    """Failure-mode behavior of `merge`: skips, non-files, binary input."""
+    """Failure-mode behavior of `merge`."""
 
     def test_missing_file_is_skipped_others_still_merged(self):
-        """A non-existent path is skipped; remaining files still merge."""
         missing = self.tmpdir / "does-not-exist.txt"
         present = self._write("b.txt", "beta\n")
         result = self._merge([missing, present])
         self.assertIn("beta", result)
 
     def test_directory_path_is_skipped(self):
-        """A directory passed as a 'file' is skipped, not merged."""
         subdir = self.tmpdir / "subdir"
         subdir.mkdir()
         present = self._write("b.txt", "beta\n")
         result = self._merge([subdir, present])
         self.assertIn("beta", result)
-        self.assertNotIn("File 1 of 2: subdir", result)
+        # Only one file successfully read, so banner shows [1/1] not [1/2].
+        self.assertIn("[1/1]", result)
+        self.assertNotIn("[1/2]", result)
 
     def test_non_utf8_bytes_do_not_crash(self):
-        """Invalid UTF-8 bytes are replaced (errors='replace'); merge succeeds."""
         binary = self.tmpdir / "binary.bin"
         binary.write_bytes(b"valid \xff\xfe invalid\n")
         result = self._merge([binary], no_banners=True)
         self.assertIn("valid", result)
         self.assertIn("invalid", result)
 
-    def test_empty_file_is_handled(self):
-        """An empty file becomes a single '\\n' (trailing-newline rule), then
-        subsequent files merge normally."""
+    def test_empty_file_contributes_nothing_in_no_banners_mode(self):
+        """An empty file produces no content in --no-banners output (cleaner
+        than the prior 'inject \\n for empty files' behavior)."""
         empty = self._write("empty.txt", "")
         present = self._write("b.txt", "beta\n")
         result = self._merge([empty, present], no_banners=True)
-        self.assertEqual(result, "\nbeta\n")
+        self.assertEqual(result, "beta\n")
 
     def test_reports_skipped_count_in_stdout(self):
         """Final summary reports successfully-merged count vs. input count."""
@@ -252,43 +334,331 @@ class TestMergeEdgeCases(_MergeTestBase):
         present = self._write("b.txt", "beta\n")
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(io.StringIO()):
-            merge_files.merge(files=[missing, present], output=self.output)
+            merge_files.merge(
+                files=[missing, present],
+                output_base=self.output,
+                max_lines=self.HUGE_CAP,
+            )
         self.assertIn("Merged 1/2 file(s)", buf.getvalue())
+
+
+class TestPlanChunks(unittest.TestCase):
+    """Bin-packing: `plan_chunks` decides which records land in which merge files."""
+
+    def _record(self, path: str, n_lines: int, index: int = 1, total: int = 1):
+        lines = [f"line{i}\n" for i in range(1, n_lines + 1)]
+        return merge_files.FileRecord(
+            path=Path(path), index=index, total=total,
+            lines=lines, sha="x" * 64, sha_normalized="y" * 64,
+        )
+
+    def test_small_files_packed_into_one_merge_file(self):
+        """Whole files that all fit under the cap share one merge file."""
+        records = [
+            self._record("a.txt", 10, 1, 3),
+            self._record("b.txt", 20, 2, 3),
+            self._record("c.txt", 30, 3, 3),
+        ]
+        plan = merge_files.plan_chunks(records, cap=200)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(len(plan[0]), 3)
+        self.assertFalse(any(c.is_split for c in plan[0]))
+
+    def test_overflow_starts_new_merge_file(self):
+        """When the next whole file doesn't fit, a new merge file starts."""
+        # cap=20, banner=2 → each merge file holds ~18 content lines.
+        records = [
+            self._record("a.txt", 10, 1, 3),  # 12 lines
+            self._record("b.txt", 5, 2, 3),   # 7 lines  → fits with a (12+7=19 ≤ 20)
+            self._record("c.txt", 10, 3, 3),  # 12 lines → doesn't fit (19+12 > 20)
+        ]
+        plan = merge_files.plan_chunks(records, cap=20)
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(len(plan[0]), 2)  # a + b
+        self.assertEqual(len(plan[1]), 1)  # c
+
+    def test_oversized_file_is_split(self):
+        """A single file > cap is split into ceil(L / (cap - banner)) parts."""
+        # cap=10, banner=2 → 8 content lines per non-last part.
+        records = [self._record("big.py", 25, 1, 1)]
+        plan = merge_files.plan_chunks(records, cap=10)
+        # 25 lines / 8 = ceil(3.125) = 4 parts (8 + 8 + 8 + 1).
+        self.assertEqual(len(plan), 4)
+        all_chunks = [c for mf in plan for c in mf]
+        self.assertEqual(len(all_chunks), 4)
+        for i, chunk in enumerate(all_chunks, start=1):
+            self.assertTrue(chunk.is_split)
+            self.assertEqual(chunk.part_n, i)
+            self.assertEqual(chunk.part_total, 4)
+        # Ranges are contiguous and cover [1, 25].
+        ranges = [(c.range_start, c.range_end) for c in all_chunks]
+        self.assertEqual(ranges, [(1, 8), (9, 16), (17, 24), (25, 25)])
+
+    def test_split_part_lines_match_range_width(self):
+        """Invariant from the spec: every chunk's content line count equals
+        range_end - range_start + 1."""
+        records = [self._record("big.py", 23, 1, 1)]
+        plan = merge_files.plan_chunks(records, cap=10)
+        for mf in plan:
+            for c in mf:
+                if c.is_split:
+                    self.assertEqual(
+                        len(c.content_lines),
+                        c.range_end - c.range_start + 1,
+                        f"Invariant violated on part {c.part_n}/{c.part_total}",
+                    )
+
+    def test_split_file_tail_can_share_merge_file_with_next_file(self):
+        """The FINAL part of a split file can be followed by more whole files
+        in the same merge file (Q3 locked-in rule)."""
+        # cap=10, banner=2 → 8 content lines per full part.
+        # big.py: 18 lines → parts 1,2 fill 2 merge files (8 each), part 3 = 2 lines.
+        # small.py: 3 lines → fits with part 3 (banner+2 + banner+3 = 9 ≤ 10).
+        records = [
+            self._record("big.py", 18, 1, 2),
+            self._record("small.py", 3, 2, 2),
+        ]
+        plan = merge_files.plan_chunks(records, cap=10)
+        self.assertEqual(len(plan), 3)
+        self.assertEqual([c.is_split for c in plan[0]], [True])
+        self.assertEqual([c.is_split for c in plan[1]], [True])
+        self.assertEqual(plan[0][0].part_n, 1)
+        self.assertEqual(plan[1][0].part_n, 2)
+        self.assertEqual(len(plan[2]), 2)
+        self.assertTrue(plan[2][0].is_split)
+        self.assertEqual(plan[2][0].part_n, 3)
+        self.assertFalse(plan[2][1].is_split)
+        self.assertEqual(plan[2][1].record.path, Path("small.py"))
+
+    def test_split_file_always_starts_fresh_merge_file(self):
+        """If the current merge file is non-empty when we encounter a file
+        that needs splitting, we close current first — split files never
+        share their FIRST part with prior content."""
+        # cap=20, banner=2 → 18 content lines per part.
+        # small.py: 5 lines → fits in merge file 1 (banner+5=7 lines).
+        # big.py: 30 lines → must split. Should NOT share merge file 1.
+        records = [
+            self._record("small.py", 5, 1, 2),
+            self._record("big.py", 30, 2, 2),
+        ]
+        plan = merge_files.plan_chunks(records, cap=20)
+        # merge file 1: just small.py. merge file 2: big.py part 1. merge file 3: big.py part 2.
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(len(plan[0]), 1)
+        self.assertEqual(plan[0][0].record.path, Path("small.py"))
+        self.assertFalse(plan[0][0].is_split)
+        self.assertTrue(plan[1][0].is_split)
+        self.assertEqual(plan[1][0].part_n, 1)
+
+    def test_file_exactly_at_cap_after_banner_is_not_split(self):
+        """A file whose content + banner == cap fits without splitting."""
+        records = [self._record("exact.py", 8, 1, 1)]  # 8 + 2 banner = 10 = cap
+        plan = merge_files.plan_chunks(records, cap=10)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(len(plan[0]), 1)
+        self.assertFalse(plan[0][0].is_split)
+
+    def test_file_one_line_over_cap_is_split_into_two_parts(self):
+        """File with content==cap leaves no room for the banner → 2 parts,
+        with a tiny tail (the documented edge-case quirk)."""
+        records = [self._record("tiny-over.py", 10, 1, 1)]  # 10 + 2 = 12 > cap 10
+        plan = merge_files.plan_chunks(records, cap=10)
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[0][0].part_n, 1)
+        self.assertEqual(plan[1][0].part_n, 2)
+        self.assertEqual(len(plan[0][0].content_lines), 8)  # cap - banner
+        self.assertEqual(len(plan[1][0].content_lines), 2)  # remainder
+
+    def test_empty_records_returns_empty_plan(self):
+        plan = merge_files.plan_chunks([], cap=100)
+        self.assertEqual(plan, [])
+
+    def test_cap_too_small_raises(self):
+        """A cap that leaves no room for content is rejected."""
+        with self.assertRaises(ValueError):
+            merge_files.plan_chunks([self._record("a.txt", 1)], cap=2)
+
+
+class TestOutputPaths(unittest.TestCase):
+    """Filename generation: `output_paths`."""
+
+    def test_single_file_uses_base_unchanged(self):
+        """count == 1 returns base verbatim — no -partNN suffix."""
+        base = Path("/tmp/out.txt")
+        self.assertEqual(merge_files.output_paths(base, 1), [base])
+
+    def test_split_inserts_part_before_extension(self):
+        """count > 1 inserts -partNN before the final '.' extension."""
+        base = Path("/tmp/out.txt")
+        paths = merge_files.output_paths(base, 3)
+        self.assertEqual(paths, [
+            Path("/tmp/out-part01.txt"),
+            Path("/tmp/out-part02.txt"),
+            Path("/tmp/out-part03.txt"),
+        ])
+
+    def test_padding_is_at_least_two_digits(self):
+        """A 5-part batch uses 2-digit padding, not 1-digit."""
+        paths = merge_files.output_paths(Path("/tmp/o.txt"), 5)
+        self.assertTrue(all("-part0" in p.name for p in paths))
+
+    def test_padding_expands_for_three_digit_counts(self):
+        """A 100-part batch uses 3-digit padding throughout."""
+        paths = merge_files.output_paths(Path("/tmp/o.txt"), 100)
+        self.assertIn("o-part001.txt", str(paths[0]))
+        self.assertIn("o-part100.txt", str(paths[-1]))
+
+    def test_padding_consistent_within_batch(self):
+        """Width stays the same across all parts of a single batch."""
+        paths = merge_files.output_paths(Path("/tmp/o.txt"), 12)
+        widths = {p.name.split("-part")[1].split(".")[0] for p in paths}
+        self.assertTrue(all(len(w) == 2 for w in widths))
+
+    def test_no_extension_appends_part_suffix(self):
+        """`-o foo` (no extension) → `foo-part01`, etc."""
+        paths = merge_files.output_paths(Path("/tmp/foo"), 2)
+        self.assertEqual(paths, [Path("/tmp/foo-part01"), Path("/tmp/foo-part02")])
+
+    def test_multi_dot_extension_splits_at_last_dot(self):
+        """`-o foo.tar.gz` splits at the last '.': foo.tar-part01.gz.
+        Documented rule — users with compound extensions should pass `-o foo`."""
+        paths = merge_files.output_paths(Path("/tmp/foo.tar.gz"), 2)
+        self.assertEqual(paths, [
+            Path("/tmp/foo.tar-part01.gz"),
+            Path("/tmp/foo.tar-part02.gz"),
+        ])
+
+
+class TestSplittingEndToEnd(_MergeTestBase):
+    """End-to-end: merge() produces split outputs that reassemble correctly."""
+
+    def _make_file(self, name: str, n_lines: int) -> Path:
+        content = "".join(f"{name}-line-{i}\n" for i in range(1, n_lines + 1))
+        return self._write(name, content)
+
+    def test_split_produces_multiple_output_files(self):
+        big = self._make_file("big.txt", 50)
+        paths = self._merge_paths([big], max_lines=20)
+        self.assertGreater(len(paths), 1)
+        # All paths exist and are non-empty.
+        for p in paths:
+            self.assertTrue(p.exists())
+            self.assertGreater(p.stat().st_size, 0)
+
+    def test_split_paths_use_part_naming(self):
+        big = self._make_file("big.txt", 50)
+        paths = self._merge_paths([big], max_lines=20)
+        self.assertTrue(all("-part" in p.name for p in paths))
+
+    def test_split_reassembly_reproduces_original_content(self):
+        """Concatenating all part contents (with banners stripped) reproduces
+        the original file. This is the spec's primary reassembly contract."""
+        n_lines = 137
+        big = self._make_file("big.txt", n_lines)
+        original = big.read_text(encoding="utf-8")
+        paths = self._merge_paths([big], max_lines=15)
+
+        # For each part, find its banner pair and extract the content slice.
+        reassembled_parts: dict[int, str] = {}
+        for p in paths:
+            text = p.read_text(encoding="utf-8")
+            lines = text.split("\n")
+            i = 0
+            while i < len(lines):
+                if lines[i].startswith("=== ["):
+                    line1 = lines[i]
+                    line2 = lines[i + 1]
+                    m1 = BANNER_LINE1_RE.match(line1)
+                    m2 = BANNER_LINE2_SPLIT_RE.match(line2)
+                    self.assertIsNotNone(m1)
+                    self.assertIsNotNone(m2)
+                    chunk_n_lines = int(m1.group(4))
+                    part_n = int(m2.group(2))
+                    # Content immediately follows line 2; chunk_n_lines lines.
+                    content_lines = lines[i + 2 : i + 2 + chunk_n_lines]
+                    reassembled_parts[part_n] = "\n".join(content_lines) + "\n"
+                    i = i + 2 + chunk_n_lines
+                else:
+                    i += 1
+
+        reassembled = "".join(reassembled_parts[k] for k in sorted(reassembled_parts))
+        self.assertEqual(reassembled, original)
+
+    def test_split_banners_all_carry_same_whole_file_sha(self):
+        """Every chunk of a split file shares the same `sha=` (the whole-file
+        SHA) — that's the reassembly anchor."""
+        big = self._make_file("big.txt", 80)
+        original_bytes = big.read_bytes()
+        expected_sha = hashlib.sha256(original_bytes).hexdigest()
+        paths = self._merge_paths([big], max_lines=20)
+        all_text = "".join(p.read_text(encoding="utf-8") for p in paths)
+        shas_in_split_banners = re.findall(
+            r"=== sha=([a-f0-9]{64})  part=", all_text
+        )
+        self.assertGreater(len(shas_in_split_banners), 1)
+        self.assertTrue(all(s == expected_sha for s in shas_in_split_banners))
+
+    def test_split_part_total_is_consistent_across_chunks(self):
+        """part=N/M — M is the same for every chunk of one file."""
+        big = self._make_file("big.txt", 60)
+        paths = self._merge_paths([big], max_lines=20)
+        all_text = "".join(p.read_text(encoding="utf-8") for p in paths)
+        totals = re.findall(r"  part=\d+/(\d+)  ", all_text)
+        self.assertGreater(len(totals), 1)
+        self.assertEqual(len(set(totals)), 1)
+
+    def test_lines_range_invariant_holds_in_real_output(self):
+        """The K == B - A + 1 invariant holds for every split chunk
+        in real merged output."""
+        big = self._make_file("big.txt", 100)
+        paths = self._merge_paths([big], max_lines=15)
+        all_text = "".join(p.read_text(encoding="utf-8") for p in paths)
+        line_pairs = re.findall(
+            r"(=== \[\d+/\d+\] .+ · (\d+) lines)\n"
+            r"=== sha=[a-f0-9]{64}  part=\d+/\d+  range=(\d+)-(\d+)/\d+",
+            all_text,
+        )
+        self.assertGreater(len(line_pairs), 1)
+        for _, k_str, a_str, b_str in line_pairs:
+            k, a, b = int(k_str), int(a_str), int(b_str)
+            self.assertEqual(k, b - a + 1,
+                             f"invariant broke: K={k}, range={a}-{b}")
+
+    def test_single_output_keeps_base_name_under_cap(self):
+        """If everything fits under the cap, the output is one file with
+        the base name unchanged (no -part suffix)."""
+        small = self._make_file("small.txt", 5)
+        paths = self._merge_paths([small], max_lines=100)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0], self.output)
 
 
 class TestExpandPaths(unittest.TestCase):
     """Directory expansion (`expand_paths`)."""
 
     def setUp(self):
-        """Allocate a per-test temp directory."""
         self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def _touch(self, rel: str, content: str = "x\n") -> Path:
-        """Create a file at `rel` (relative to tmpdir) and any parent dirs."""
         path = self.tmpdir / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return path
 
     def test_plain_files_pass_through_unchanged(self):
-        """Non-directory paths are returned in the same order they came in."""
         a = self._touch("a.txt")
         b = self._touch("b.txt")
-        result = merge_files.expand_paths([a, b])
-        self.assertEqual(result, [a, b])
+        self.assertEqual(merge_files.expand_paths([a, b]), [a, b])
 
     def test_flat_directory_expanded_alphabetically(self):
-        """A folder of files becomes a sorted list of those files."""
         d = self.tmpdir / "flat"
         d.mkdir()
         c = self._touch("flat/c.txt")
         a = self._touch("flat/a.txt")
         b = self._touch("flat/b.txt")
-        result = merge_files.expand_paths([d])
-        self.assertEqual(result, [a, b, c])
+        self.assertEqual(merge_files.expand_paths([d]), [a, b, c])
 
     def test_nested_directory_walked_recursively(self):
-        """Files in subdirectories are included, deterministically ordered."""
         root = self.tmpdir / "proj"
         root.mkdir()
         top = self._touch("proj/top.txt")
@@ -296,62 +666,53 @@ class TestExpandPaths(unittest.TestCase):
         deeper = self._touch("proj/sub/inner/deeper.txt")
         result = merge_files.expand_paths([root])
         self.assertEqual(set(result), {top, deep, deeper})
-        # Sorted ⇒ shallower 'top.txt' comes after 'sub/...' lexicographically.
-        # The exact order isn't user-promised, but it must be deterministic.
         self.assertEqual(result, sorted(result))
 
     def test_hidden_files_in_directory_are_included(self):
-        """Dot-prefixed files inside a folder are included — they're often
-        project config (.env.example, .eslintrc, etc.)."""
         d = self.tmpdir / "withhidden"
         d.mkdir()
         visible = self._touch("withhidden/visible.txt")
         hidden = self._touch("withhidden/.env.example")
-        result = merge_files.expand_paths([d])
-        self.assertEqual(set(result), {visible, hidden})
+        self.assertEqual(set(merge_files.expand_paths([d])), {visible, hidden})
+
+    def test_ds_store_files_are_excluded(self):
+        d = self.tmpdir / "macfolder"
+        d.mkdir()
+        kept = self._touch("macfolder/keep.txt")
+        self._touch("macfolder/.DS_Store", "finder junk\n")
+        self._touch("macfolder/nested/.DS_Store", "more junk\n")
+        kept_nested = self._touch("macfolder/nested/keep2.txt")
+        self.assertEqual(set(merge_files.expand_paths([d])), {kept, kept_nested})
 
     def test_hidden_subdirectories_are_walked(self):
-        """Files inside hidden subtrees (.github/, .claude/, etc.) are merged
-        too — these often hold workflows, config, or agent definitions."""
         root = self.tmpdir / "proj"
         root.mkdir()
         readme = self._touch("proj/README.md")
         workflow = self._touch("proj/.github/workflows/ci.yml")
-        result = merge_files.expand_paths([root])
-        self.assertEqual(set(result), {readme, workflow})
+        self.assertEqual(set(merge_files.expand_paths([root])), {readme, workflow})
 
     def test_mixed_file_and_directory_args(self):
-        """File args and directory args coexist in the result in input order."""
         loose = self._touch("loose.txt")
         d = self.tmpdir / "bundle"
         d.mkdir()
         inside = self._touch("bundle/inside.txt")
-        result = merge_files.expand_paths([loose, d])
-        self.assertEqual(result, [loose, inside])
+        self.assertEqual(merge_files.expand_paths([loose, d]), [loose, inside])
 
     def test_empty_directory_contributes_nothing(self):
-        """An empty folder produces no entries and doesn't error."""
         empty = self.tmpdir / "empty"
         empty.mkdir()
         other = self._touch("other.txt")
-        result = merge_files.expand_paths([empty, other])
-        self.assertEqual(result, [other])
+        self.assertEqual(merge_files.expand_paths([empty, other]), [other])
 
     def test_hidden_file_passed_directly_is_preserved(self):
-        """Filtering only applies during folder expansion: a user who
-        explicitly names a hidden file as an argument still gets it merged."""
         hidden = self._touch(".env")
-        result = merge_files.expand_paths([hidden])
-        self.assertEqual(result, [hidden])
+        self.assertEqual(merge_files.expand_paths([hidden]), [hidden])
 
     def test_nonexistent_path_is_preserved_for_merge_to_warn(self):
-        """Missing paths fall through unchanged so merge() can warn about them."""
         missing = self.tmpdir / "does-not-exist"
-        result = merge_files.expand_paths([missing])
-        self.assertEqual(result, [missing])
+        self.assertEqual(merge_files.expand_paths([missing]), [missing])
 
     def test_symlink_to_file_in_dir_is_skipped(self):
-        """Symlinks discovered during folder expansion are not included."""
         d = self.tmpdir / "dir"
         d.mkdir()
         real = self._touch("dir/real.txt")
@@ -360,37 +721,32 @@ class TestExpandPaths(unittest.TestCase):
             link.symlink_to(real)
         except (OSError, NotImplementedError):
             self.skipTest("symlinks not supported on this filesystem")
-        result = merge_files.expand_paths([d])
-        self.assertEqual(result, [real])
+        self.assertEqual(merge_files.expand_paths([d]), [real])
 
     def test_folder_drop_end_to_end_through_merge(self):
-        """Dropping a folder and feeding the expanded list through merge()
-        produces a banner per file inside the folder."""
         d = self.tmpdir / "drop"
         d.mkdir()
-        self._touch("drop/one.txt", "ONE\n")
-        self._touch("drop/two.txt", "TWO\n")
+        (d / "one.txt").write_text("ONE\n")
+        (d / "two.txt").write_text("TWO\n")
         files = merge_files.expand_paths([d])
         output = self.tmpdir / "out.txt"
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            merge_files.merge(files=files, output=output)
+            merge_files.merge(files=files, output_base=output, max_lines=10 ** 9)
         result = output.read_text(encoding="utf-8")
-        self.assertIn("File 1 of 2", result)
-        self.assertIn("File 2 of 2", result)
+        self.assertIn("[1/2]", result)
+        self.assertIn("[2/2]", result)
         self.assertIn("ONE", result)
         self.assertIn("TWO", result)
 
 
 class TestMain(unittest.TestCase):
-    """End-to-end tests for `main` — focused on output-path resolution."""
+    """End-to-end tests for `main`."""
 
     def setUp(self):
-        """Allocate temp dir and save argv/platform so we can restore them."""
         self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.addCleanup(setattr, sys, "argv", sys.argv)
 
     def _run_main(self, argv):
-        """Invoke main() with given argv, forcing non-darwin to skip `open`."""
         sys.argv = ["merge-files.py"] + argv
         original_platform = merge_files.sys.platform
         merge_files.sys.platform = "linux"
@@ -400,34 +756,25 @@ class TestMain(unittest.TestCase):
         finally:
             merge_files.sys.platform = original_platform
 
-    def test_creates_missing_parent_dir_for_output(self):
-        """Regression: `-o` with a non-existent parent directory must not crash.
-
-        Previously only the default-output path created its parent dir, so a
-        user-supplied `-o some/missing/dir/out.txt` raised FileNotFoundError
-        inside merge() when opening the output for writing.
-        """
-        src = self._write_src("hello\n")
-        nested_out = self.tmpdir / "does" / "not" / "exist" / "out.txt"
-
-        rc = self._run_main([str(src), "-o", str(nested_out)])
-
-        self.assertEqual(rc, 0)
-        self.assertTrue(nested_out.exists())
-        self.assertIn("hello", nested_out.read_text(encoding="utf-8"))
-
     def _write_src(self, content: str) -> Path:
-        """Create a single source file in the test's temp dir."""
         path = self.tmpdir / "src.txt"
         path.write_text(content, encoding="utf-8")
         return path
+
+    def test_creates_missing_parent_dir_for_output(self):
+        """`-o` with a non-existent parent directory must not crash."""
+        src = self._write_src("hello\n")
+        nested_out = self.tmpdir / "does" / "not" / "exist" / "out.txt"
+        rc = self._run_main([str(src), "-o", str(nested_out)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(nested_out.exists())
+        self.assertIn("hello", nested_out.read_text(encoding="utf-8"))
 
 
 class TestParseArgs(unittest.TestCase):
     """Argument parsing (`parse_args`)."""
 
     def _parse(self, argv):
-        """Invoke parse_args() with a temporary sys.argv override."""
         saved = sys.argv
         try:
             sys.argv = ["merge-files.py"] + argv
@@ -436,35 +783,43 @@ class TestParseArgs(unittest.TestCase):
             sys.argv = saved
 
     def test_requires_at_least_one_file(self):
-        """argparse should reject an empty argv with SystemExit."""
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 self._parse([])
 
     def test_files_collected_in_order(self):
-        """Positional file args are preserved in the order they were given."""
         ns = self._parse(["a.py", "b.rb", "c.yml"])
         self.assertEqual([p.name for p in ns.files], ["a.py", "b.rb", "c.yml"])
 
     def test_output_flag(self):
-        """`-o` sets the output path as a Path."""
         ns = self._parse(["a.py", "-o", "/srv/output/merged.txt"])
         self.assertEqual(ns.output, Path("/srv/output/merged.txt"))
 
     def test_output_defaults_to_none(self):
-        """Without `-o`, output is None (main() resolves the default later)."""
         ns = self._parse(["a.py"])
         self.assertIsNone(ns.output)
 
     def test_no_banners_flag(self):
-        """`--no-banners` sets the flag to True."""
         ns = self._parse(["a.py", "--no-banners"])
         self.assertTrue(ns.no_banners)
 
     def test_no_banners_defaults_to_false(self):
-        """Without `--no-banners`, the flag is False."""
         ns = self._parse(["a.py"])
         self.assertFalse(ns.no_banners)
+
+    def test_max_lines_defaults_to_3500(self):
+        ns = self._parse(["a.py"])
+        self.assertEqual(ns.max_lines, 3500)
+
+    def test_max_lines_accepts_override(self):
+        ns = self._parse(["a.py", "--max-lines", "1500"])
+        self.assertEqual(ns.max_lines, 1500)
+
+    def test_max_lines_floor_is_enforced(self):
+        """Values below MIN_MAX_LINES are rejected by argparse with SystemExit."""
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self._parse(["a.py", "--max-lines", "5"])
 
 
 if __name__ == "__main__":
