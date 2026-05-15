@@ -51,6 +51,66 @@ BANNER_LINE2_SPLIT_RE = re.compile(
 )
 
 
+class TestDisplayPathFor(unittest.TestCase):
+    """Path-trimming rule: if any 'app' component exists, keep from one
+    directory before it; otherwise leave unchanged."""
+
+    def test_user_example_from_request(self):
+        """The motivating example: keep `<dir-before-app>/app/...`."""
+        result = merge_files.display_path_for(Path(
+            "/Users/mark.a.nichols/Documents/Projects/Checkers/checkers/app/view/foo.py"
+        ))
+        self.assertEqual(result, Path("checkers/app/view/foo.py"))
+
+    def test_no_app_component_returns_path_unchanged(self):
+        """If 'app' isn't a path component, the full path is preserved."""
+        original = Path("/Users/x/Documents/Projects/foo/bar.py")
+        self.assertEqual(merge_files.display_path_for(original), original)
+
+    def test_relative_path_with_app_preserves_prefix(self):
+        """Relative paths already start before 'app'; no trim needed."""
+        original = Path("src/app/main.py")
+        self.assertEqual(merge_files.display_path_for(original), original)
+
+    def test_app_at_root_of_relative_path(self):
+        """No directory exists before 'app', so the path is returned as-is."""
+        original = Path("app/main.py")
+        self.assertEqual(merge_files.display_path_for(original), original)
+
+    def test_app_at_root_of_absolute_path(self):
+        """`/app/main.py` becomes `app/main.py` — the anchor is stripped but
+        no preceding directory exists to keep."""
+        result = merge_files.display_path_for(Path("/app/main.py"))
+        self.assertEqual(result, Path("app/main.py"))
+
+    def test_nested_app_components_anchor_on_outermost(self):
+        """First-occurrence rule: with two `app/` levels, anchor on the
+        outer one so the consumer sees the broader context."""
+        result = merge_files.display_path_for(Path(
+            "/x/y/proj/app/services/app/main.py"
+        ))
+        self.assertEqual(result, Path("proj/app/services/app/main.py"))
+
+    def test_app_as_filename_at_end_of_path(self):
+        """A file or dir literally named `app` at the end still triggers
+        the rule (step back one)."""
+        result = merge_files.display_path_for(Path("/x/y/app"))
+        self.assertEqual(result, Path("y/app"))
+
+    def test_substring_matches_do_not_trigger(self):
+        """`apple`, `application`, etc. are NOT path components named 'app'
+        and must not trigger trimming."""
+        original = Path("/Users/x/apple/foo.py")
+        self.assertEqual(merge_files.display_path_for(original), original)
+        original2 = Path("/Users/x/application/bar.py")
+        self.assertEqual(merge_files.display_path_for(original2), original2)
+
+    def test_app_inside_directory_name_does_not_trigger(self):
+        """A directory named like `my-app` or `app-server` is not 'app'."""
+        original = Path("/Users/x/my-app/foo.py")
+        self.assertEqual(merge_files.display_path_for(original), original)
+
+
 class TestMakeBanner(unittest.TestCase):
     """2-line banner format for whole (unsplit) files."""
 

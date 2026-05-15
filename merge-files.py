@@ -53,6 +53,54 @@ MIN_MAX_LINES = 10
 # if more "always-junk" filenames come up.
 EXCLUDED_FILENAMES = frozenset({".DS_Store"})
 
+# Path components that anchor the banner display path. If any file's path
+# contains a component matching one of these, the displayed path starts at
+# the directory immediately before the first matching component (see
+# display_path_for). The initial entry — 'app' — is the Rails/Laravel
+# convention for source-tree roots; add more anchors here as new project
+# layouts come up. Beware of common names like 'src' or 'lib': they appear
+# in many unrelated paths and would over-trigger trimming.
+DISPLAY_PATH_ANCHORS = ("app",)
+
+
+def display_path_for(path: Path) -> Path:
+    """Trim a path to start one directory before the first anchor component.
+
+    "Anchors" are listed in DISPLAY_PATH_ANCHORS — currently just `app` for
+    Rails-style layouts. If any anchor name appears as a path component,
+    the display path starts at the directory immediately before the first
+    matching component and drops everything to the left. If no anchor is
+    present, the path is returned unchanged.
+
+    Examples (with `app` as an anchor):
+      /Users/x/Projects/Checkers/checkers/app/view/foo.py
+        → checkers/app/view/foo.py
+      /Users/x/Projects/Checkers/checkers/README.md   (no anchor)
+        → /Users/x/Projects/Checkers/checkers/README.md
+      /app/main.py            (anchor at root — no preceding directory)
+        → app/main.py
+
+    First-occurrence wins so nested anchor folders inside a project still
+    trim back to the outermost one (e.g. `proj/app/services/app/main.py`
+    keeps `proj/...`, not `services/...`).
+    """
+    parts = path.parts
+    # Skip the filesystem anchor ('/' or drive letter) when searching — we
+    # never want an absolute prefix like '/app/...' in the display path.
+    if parts and (parts[0] in ("/", "\\") or parts[0].endswith(":\\")):
+        searchable = parts[1:]
+    else:
+        searchable = parts
+    anchor_idx = next(
+        (i for i, part in enumerate(searchable) if part in DISPLAY_PATH_ANCHORS),
+        None,
+    )
+    if anchor_idx is None:
+        return path
+    start = max(anchor_idx - 1, 0)
+    new_parts = searchable[start:]
+    return Path(*new_parts) if new_parts else path
+
 
 def make_banner(
     path: Path,
@@ -141,12 +189,13 @@ class Chunk:
         return self.part_n is not None
 
     def render(self) -> str:
+        display_path = display_path_for(self.record.path)
         if self.is_split:
             assert self.part_total is not None
             assert self.range_start is not None
             assert self.range_end is not None
             banner = make_split_banner(
-                path=self.record.path,
+                path=display_path,
                 index=self.record.index,
                 total=self.record.total,
                 chunk_lines=len(self.content_lines),
@@ -159,7 +208,7 @@ class Chunk:
             )
         else:
             banner = make_banner(
-                path=self.record.path,
+                path=display_path,
                 index=self.record.index,
                 total=self.record.total,
                 lines=len(self.content_lines),

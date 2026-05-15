@@ -33,8 +33,21 @@ Every banner is **exactly 2 lines**. Two shapes exist:
 - `N/M` — this file's 1-based position out of `M` successfully-read files
   in the batch. (Files that were skipped — missing, unreadable, or not
   regular files — are not counted; the consumer sees a gap-free sequence.)
-- `<full/path/to/file>` — the path as the tool saw it (relative or
-  absolute, exactly as passed in or as expanded from a directory).
+- `<full/path/to/file>` — the file's **display path**. This is a trimmed
+  form of the on-disk path designed to keep banner lines short:
+    - The tool maintains a list of *anchor* component names (initially
+      just `app`, for Rails-style layouts). More anchors may be added in
+      future versions.
+    - If any path component matches an anchor, the display path starts at
+      the directory immediately before the first matching component and
+      drops everything to the left. So
+      `/Users/x/Projects/Checkers/checkers/app/view/foo.py` displays as
+      `checkers/app/view/foo.py`.
+    - If no anchor matches, the display path is the path as the tool saw
+      it (unchanged).
+  The display path is a label, not a filesystem identifier — two distinct
+  files could in principle produce the same display path. Use `sha=` (§4)
+  for content identity, not the path.
 - `K lines` — number of content lines that follow this banner in this
   merge file. The file content begins on the line immediately after line 2
   of the banner and runs for exactly `K` lines.
