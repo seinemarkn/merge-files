@@ -38,6 +38,13 @@ from pathlib import Path
 # know how much room is available for content in each merge file.
 BANNER_LINES = 2
 
+# Every merge file (when banners are enabled) starts with a single-line
+# "=== merge-file P/Q" header that lets a consumer order the merge files
+# from content alone, without relying on filenames. This costs 1 line off
+# the cap per merge file. Suppressed in --no-banners mode (where there's
+# no reassembly metadata to anchor anyway).
+MERGE_FILE_HEADER_LINES = 1
+
 # Default line cap per merge file (banners included). 3,500 is sized to keep
 # each merge file inside the single-agent comfort zone for downstream
 # consumption — adjustable via --max-lines.
@@ -61,6 +68,34 @@ EXCLUDED_FILENAMES = frozenset({".DS_Store"})
 # layouts come up. Beware of common names like 'src' or 'lib': they appear
 # in many unrelated paths and would over-trigger trimming.
 DISPLAY_PATH_ANCHORS = ("app",)
+
+
+def is_likely_binary(data: bytes, sample_size: int = 8192) -> bool:
+    """Return True if `data` looks like a binary file rather than text.
+
+    Uses the classic Unix NUL-byte heuristic: if a NUL (`\\x00`) appears in
+    the first `sample_size` bytes, the file is binary. This is what git
+    diff, grep -I, and most other tools use because it's cheap, doesn't
+    depend on filename extensions, and is correct for every common binary
+    format (PNG/JPEG/PDF/zip/executables — all of which have NULs in their
+    headers or near-headers).
+
+    Trade-off: legitimate UTF-16/UTF-32 text files have NULs and will be
+    flagged as binary. Acceptable for the use case (merging source code,
+    config, docs, etc.) where UTF-8 dominates.
+    """
+    return b"\x00" in data[:sample_size]
+
+
+def make_merge_file_header(part_n: int, total: int) -> str:
+    """Return the 1-line header that appears at the top of every merge file.
+
+    Shape: `=== merge-file P/Q\\n`. Distinguishable from a file banner's
+    line 1 by the absence of `[` after the `=== ` prefix — consumers
+    parsing with `^=== merge-file (\\d+)/(\\d+)$` will not collide with the
+    existing `^=== \\[...\\]` file-banner regex.
+    """
+    return f"=== merge-file {part_n}/{total}\n"
 
 
 def display_path_for(path: Path) -> Path:
@@ -272,6 +307,9 @@ def read_records(files: list[Path]) -> list[FileRecord]:
         except OSError as err:
             print(f"  ⚠️  Read error on {path}: {err}", file=sys.stderr)
             continue
+        if is_likely_binary(data):
+            print(f"  ⚠️  Skipping (binary content): {path}", file=sys.stderr)
+            continue
         text = data.decode("utf-8", errors="replace")
         # Force a trailing newline so split boundaries are always between
         # complete lines. Without this, a file whose last line has no \n
@@ -413,14 +451,19 @@ def merge(
         print(f"   Output: {output_base}")
         return [output_base]
 
-    plan = plan_chunks(records, cap=max_lines)
+    # Reserve MERGE_FILE_HEADER_LINES per merge file. The bin-packer sees a
+    # cap reduced by that overhead so total banner+content+header stays at
+    # or below `max_lines` regardless of how many merge files get produced.
+    plan = plan_chunks(records, cap=max_lines - MERGE_FILE_HEADER_LINES)
     paths = output_paths(output_base, len(plan))
+    total_merge_files = len(plan)
 
-    for path, chunks in zip(paths, plan):
+    for part_n, (path, chunks) in enumerate(zip(paths, plan), start=1):
         with path.open("w", encoding="utf-8") as out:
+            out.write(make_merge_file_header(part_n, total_merge_files))
             for chunk in chunks:
                 out.write(chunk.render())
-        used = sum(c.total_lines for c in chunks)
+        used = MERGE_FILE_HEADER_LINES + sum(c.total_lines for c in chunks)
         n_split = sum(1 for c in chunks if c.is_split)
         marker = f", {n_split} split chunk(s)" if n_split else ""
         print(f"  ✓ {path.name} — {used:,} lines, {len(chunks)} chunk(s){marker}")

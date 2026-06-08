@@ -19,7 +19,30 @@ is no opt-in flag.
 
 ---
 
-## 2. Banner format
+## 2. Merge-file header
+
+Every merge file starts with a single header line that identifies its
+position within the batch:
+
+```
+=== merge-file P/Q
+```
+
+- Always present at line 1 of the merge file (when banners are enabled).
+- `P/Q` — this is merge file `P` out of `Q`. Both 1-based.
+- Lets a consumer order an unordered pile of merge files from content
+  alone: sort by `P` ascending.
+- Costs 1 line off the per-merge-file cap (default 3,500 → effective
+  3,499 for banners and content combined).
+- Suppressed in `--no-banners` mode (no reassembly metadata exists there
+  anyway).
+
+Regex: `^=== merge-file (\d+)/(\d+)$`. Distinguishable from a file banner
+by the absence of `[` after the `=== ` prefix.
+
+---
+
+## 3. Banner format
 
 Every banner is **exactly 2 lines**. Two shapes exist:
 
@@ -76,12 +99,15 @@ Every banner is **exactly 2 lines**. Two shapes exist:
 
 ---
 
-## 3. Regexes for parsing
+## 4. Regexes for parsing
 
 The two banner lines use stable, regex-friendly shapes.
 
 ```python
 import re
+
+# Merge-file header (always at line 1 of each merge file):
+MERGE_FILE_HEADER_RE = re.compile(r"^=== merge-file (\d+)/(\d+)$")
 
 # Line 1 is identical for split and non-split files:
 BANNER_LINE1_RE = re.compile(
@@ -104,12 +130,15 @@ for a parser: line 2 contains `part=` if and only if it's a split chunk.
 
 ---
 
-## 4. Invariants and verification
+## 5. Invariants and verification
 
 Every banner asserts the following invariants, which a consumer can
 cross-check to detect corruption (e.g. OCR drift in screenshot-based
 pipelines):
 
+0. **Merge files are P-ordered.** Sort the input pile of merge files by
+   the `=== merge-file P/Q` header's `P` field ascending; that is their
+   batch order. `Q` is identical across every merge file in the batch.
 1. **K equals the content-line count.** The `K lines` field on line 1 is
    the exact number of lines of file content that follow the banner. A
    parser that counts `K` lines after line 2 of the banner will land
@@ -132,7 +161,7 @@ pipelines):
 
 ---
 
-## 5. Reassembling a split file
+## 6. Reassembling a split file
 
 The reassembly rule is **plain concatenation** — no injected separators,
 no newline normalization:
@@ -165,7 +194,7 @@ also lacks one, and reassembly preserves the original state).
 
 ---
 
-## 6. Discovering all parts of a batch
+## 7. Discovering all parts of a batch
 
 The tool names output files as follows:
 
@@ -175,6 +204,11 @@ The tool names output files as follows:
   `<base>-part<NN+1>.txt`, …. `NN` is zero-padded to at least 2 digits;
   for batches of 100+ parts, padding widens to 3 (or more) digits, but
   width stays consistent within a single batch.
+
+Once you have the pile of merge files, the `=== merge-file P/Q` header
+(§2) on each one gives you their order directly — you do **not** need
+the filenames to reconstruct sequence. The filename pattern below is
+purely a discovery convenience for shell scripts and Finder.
 
 To find every merge file from a known base:
 
@@ -194,7 +228,7 @@ extension.
 
 ---
 
-## 7. End-to-end consumer workflow
+## 8. End-to-end consumer workflow
 
 ```python
 def consume_merge_batch(paths: list[Path]) -> dict[str, str]:
@@ -202,6 +236,7 @@ def consume_merge_batch(paths: list[Path]) -> dict[str, str]:
     import re, hashlib
     from collections import defaultdict
 
+    HEADER = re.compile(r"^=== merge-file (\d+)/(\d+)$")
     LINE1 = re.compile(r"^=== \[(\d+)/(\d+)\] (.+) · (\d+) lines$")
     LINE2_WHOLE = re.compile(
         r"^=== sha=([a-f0-9]{64})  sha-norm=([a-f0-9]{64})$"
@@ -210,6 +245,14 @@ def consume_merge_batch(paths: list[Path]) -> dict[str, str]:
         r"^=== sha=([a-f0-9]{64})  part=(\d+)/(\d+)  range=(\d+)-(\d+)/(\d+)$"
     )
 
+    # Order the merge files by the `merge-file P/Q` header so the consumer
+    # doesn't have to trust filenames.
+    def header_p(path):
+        line = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        m = HEADER.match(line)
+        return int(m.group(1)) if m else 0
+    paths = sorted(paths, key=header_p)
+
     # First pass: collect every chunk.
     chunks_by_sha: dict[str, list[dict]] = defaultdict(list)
     whole_files: list[tuple[str, str, str]] = []  # (path, content, sha)
@@ -217,7 +260,7 @@ def consume_merge_batch(paths: list[Path]) -> dict[str, str]:
     for p in paths:
         text = p.read_text(encoding="utf-8")
         lines = text.split("\n")
-        i = 0
+        i = 1 if HEADER.match(lines[0]) else 0  # skip the merge-file header
         while i < len(lines):
             m1 = LINE1.match(lines[i]) if i < len(lines) else None
             if not m1:
@@ -274,11 +317,13 @@ demands.
 
 ---
 
-## 8. Edge cases the consumer should expect
+## 9. Edge cases the consumer should expect
 
 - **Files skipped during merge** (missing, unreadable, not a regular
-  file) never appear in any banner. The `M` in `[N/M]` reflects only the
-  files that made it through.
+  file, or detected as binary) never appear in any banner. The `M` in
+  `[N/M]` reflects only the files that made it through. Binary detection
+  uses the classic NUL-byte-in-first-8KB heuristic — PNG/JPEG/PDF/zip/
+  executables are all excluded automatically, no extension list needed.
 - **Lossy UTF-8 decoding**: input bytes that aren't valid UTF-8 are
   replaced with the Unicode replacement character (`U+FFFD`) during merge.
   `sha=` is computed over the **raw bytes**, so consumers verifying a
@@ -303,7 +348,7 @@ demands.
 
 ---
 
-## 9. Versioning
+## 10. Versioning
 
 This format is version 1.0 (the first formal specification). Future
 changes will be communicated via a `=== format-version=N` line at the

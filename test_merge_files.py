@@ -51,6 +51,31 @@ BANNER_LINE2_SPLIT_RE = re.compile(
 )
 
 
+MERGE_FILE_HEADER_RE = re.compile(r"^=== merge-file (\d+)/(\d+)$")
+
+
+class TestMakeMergeFileHeader(unittest.TestCase):
+    """1-line merge-file-level header at the top of each output file."""
+
+    def test_format_matches_spec(self):
+        """`=== merge-file P/Q\\n` — distinguishable from file banners by
+        the absence of `[` after the `=== ` prefix."""
+        header = merge_files.make_merge_file_header(2, 5)
+        self.assertEqual(header, "=== merge-file 2/5\n")
+
+    def test_matches_consumer_regex(self):
+        """Header is parseable with the documented regex."""
+        m = MERGE_FILE_HEADER_RE.match(merge_files.make_merge_file_header(3, 7).rstrip())
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "3")
+        self.assertEqual(m.group(2), "7")
+
+    def test_does_not_collide_with_file_banner_regex(self):
+        """A merge-file header must not match the file-banner line-1 regex."""
+        header = merge_files.make_merge_file_header(1, 1).rstrip()
+        self.assertIsNone(BANNER_LINE1_RE.match(header))
+
+
 class TestDisplayPathFor(unittest.TestCase):
     """Path-trimming rule: if any 'app' component exists, keep from one
     directory before it; otherwise leave unchanged."""
@@ -354,6 +379,52 @@ class TestMergeHappyPath(_MergeTestBase):
         self.assertNotEqual(raws[0], raws[1])
 
 
+class TestIsLikelyBinary(unittest.TestCase):
+    """Binary-content heuristic (`is_likely_binary`)."""
+
+    def test_pure_ascii_is_text(self):
+        self.assertFalse(merge_files.is_likely_binary(b"hello world\n"))
+
+    def test_utf8_with_non_ascii_is_text(self):
+        """UTF-8 with multi-byte chars (no NULs) reads as text."""
+        self.assertFalse(merge_files.is_likely_binary("héllo · wörld\n".encode("utf-8")))
+
+    def test_lossy_utf8_without_nul_is_text(self):
+        """Random non-UTF-8 bytes that don't include NUL are still 'text'
+        — they'll decode lossily with U+FFFD, but that's recoverable as
+        text and isn't worth excluding from the merge."""
+        self.assertFalse(merge_files.is_likely_binary(b"valid \xff\xfe stuff\n"))
+
+    def test_empty_file_is_text(self):
+        """Empty content has no NUL, so it's treated as (trivial) text."""
+        self.assertFalse(merge_files.is_likely_binary(b""))
+
+    def test_png_signature_is_binary(self):
+        """Real PNG headers have NULs in the IHDR chunk-length bytes."""
+        self.assertTrue(merge_files.is_likely_binary(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        ))
+
+    def test_pdf_header_with_embedded_nul_is_binary(self):
+        """Synthetic PDF-like content: ASCII signature then binary stream."""
+        self.assertTrue(merge_files.is_likely_binary(
+            b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n4 0 obj\n<<\n/Length 5\x00\x00\x00>>"
+        ))
+
+    def test_zip_signature_is_binary(self):
+        """ZIP files start with PK\\x03\\x04 then have NULs."""
+        self.assertTrue(merge_files.is_likely_binary(
+            b"PK\x03\x04\x14\x00\x00\x00\x08\x00"
+        ))
+
+    def test_nul_outside_sample_window_does_not_flag_as_binary(self):
+        """NUL bytes past `sample_size` are not checked — the heuristic
+        is intentionally bounded so a giant text file with one weird byte
+        deep inside doesn't tank performance or get falsely flagged."""
+        data = b"hello\n" * 2000 + b"\x00"  # NUL well past 8 KiB
+        self.assertFalse(merge_files.is_likely_binary(data, sample_size=8192))
+
+
 class TestMergeEdgeCases(_MergeTestBase):
     """Failure-mode behavior of `merge`."""
 
@@ -387,6 +458,36 @@ class TestMergeEdgeCases(_MergeTestBase):
         present = self._write("b.txt", "beta\n")
         result = self._merge([empty, present], no_banners=True)
         self.assertEqual(result, "beta\n")
+
+    def test_binary_file_is_skipped_from_merge(self):
+        """A file with NUL bytes (PNG, PDF, zip, etc.) is skipped entirely —
+        its content never appears in the merge file, and its presence doesn't
+        affect ordering of the files that DID merge."""
+        binary = self.tmpdir / "image.png"
+        binary.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+        present = self._write("notes.md", "real text\n")
+        result = self._merge([binary, present])
+        self.assertIn("real text", result)
+        # PNG signature bytes (or their lossy decoding) must not leak through.
+        self.assertNotIn("PNG", result)
+        self.assertNotIn("IHDR", result)
+        # The merged file's banner should say [1/1], not [2/2] — the binary
+        # file is counted as a skip, not a successful merge.
+        self.assertIn("[1/1]", result)
+
+    def test_binary_skip_is_reported_to_stderr(self):
+        binary = self.tmpdir / "image.png"
+        binary.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+        present = self._write("notes.md", "real text\n")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            merge_files.merge(
+                files=[binary, present],
+                output_base=self.output,
+                max_lines=self.HUGE_CAP,
+            )
+        self.assertIn("binary content", err.getvalue())
+        self.assertIn("image.png", err.getvalue())
 
     def test_reports_skipped_count_in_stdout(self):
         """Final summary reports successfully-merged count vs. input count."""
@@ -683,6 +784,55 @@ class TestSplittingEndToEnd(_MergeTestBase):
             k, a, b = int(k_str), int(a_str), int(b_str)
             self.assertEqual(k, b - a + 1,
                              f"invariant broke: K={k}, range={a}-{b}")
+
+    def test_every_merge_file_starts_with_merge_file_header(self):
+        """Every output file's first line is `=== merge-file P/Q`."""
+        big = self._make_file("big.txt", 80)
+        paths = self._merge_paths([big], max_lines=20)
+        self.assertGreater(len(paths), 1)
+        for p in paths:
+            first = p.read_text(encoding="utf-8").split("\n", 1)[0]
+            self.assertIsNotNone(
+                MERGE_FILE_HEADER_RE.match(first),
+                f"first line not a merge-file header: {first!r}",
+            )
+
+    def test_merge_file_headers_count_from_one_to_total(self):
+        """Header P numbers run 1..N matching the number of output files."""
+        big = self._make_file("big.txt", 100)
+        paths = self._merge_paths([big], max_lines=20)
+        ps = []
+        totals = set()
+        for p in paths:
+            first = p.read_text(encoding="utf-8").split("\n", 1)[0]
+            m = MERGE_FILE_HEADER_RE.match(first)
+            assert m is not None
+            ps.append(int(m.group(1)))
+            totals.add(int(m.group(2)))
+        self.assertEqual(ps, list(range(1, len(paths) + 1)))
+        self.assertEqual(totals, {len(paths)})
+
+    def test_single_output_still_gets_a_merge_file_header(self):
+        """Even when the merge fits in one file, the header is present
+        (with `1/1`) — consumers handle one shape, not two."""
+        small = self._make_file("small.txt", 5)
+        paths = self._merge_paths([small], max_lines=100)
+        self.assertEqual(len(paths), 1)
+        first = paths[0].read_text(encoding="utf-8").split("\n", 1)[0]
+        self.assertEqual(first, "=== merge-file 1/1")
+
+    def test_header_overhead_is_subtracted_from_cap(self):
+        """Total lines in any merge file (including header) stay at or below
+        the cap — the bin-packer reserves the header line."""
+        big = self._make_file("big.txt", 200)
+        cap = 20
+        paths = self._merge_paths([big], max_lines=cap)
+        for p in paths:
+            n_lines = p.read_text(encoding="utf-8").count("\n")
+            self.assertLessEqual(
+                n_lines, cap,
+                f"{p.name} has {n_lines} lines, exceeds cap {cap}",
+            )
 
     def test_single_output_keeps_base_name_under_cap(self):
         """If everything fits under the cap, the output is one file with

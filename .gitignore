@@ -1,2 +1,6 @@
 # Built drag-and-drop wrapper — rebuild on each machine via ./build.sh
 MergeFiles.app/
+
+# Python bytecode — regenerated on every run
+__pycache__/
+*.pyc
