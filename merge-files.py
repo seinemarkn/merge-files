@@ -100,8 +100,11 @@ DEFAULT_CONFIG: dict = {
     # merge output's deletions section. Informational for the consumer only;
     # set false to omit the section entirely.
     "report_deletions": True,
-    # RESERVED (not yet enforced): file extensions to skip during folder
-    # expansion, e.g. [".log", ".min.js"]. Leading dot, matched case-insensitively.
+    # File extensions to skip during folder expansion, e.g. [".log", ".min.js"].
+    # Matched case-insensitively; a leading dot is optional in config (".log" and
+    # "log" are equivalent). Compound extensions work (".min.js" matches
+    # foo.min.js). Only applies when a directory is expanded — files named
+    # explicitly on the command line are always kept.
     "skip_extensions": [],
 }
 
@@ -165,6 +168,40 @@ def load_config() -> dict:
         print(f"  ⚠️  Config ({path}) is not a JSON object; using defaults",
               file=sys.stderr)
     return config
+
+
+def normalize_skip_extensions(raw) -> tuple[str, ...]:
+    """Normalize a config `skip_extensions` value to a tuple of match suffixes.
+
+    Each entry is lowercased, whitespace-trimmed, and given a leading dot if it
+    lacks one (so both "log" and ".log" work). Blank and non-string entries are
+    dropped. Duplicates are collapsed while preserving first-seen order.
+    """
+    if not isinstance(raw, list):
+        return ()
+    seen: dict[str, None] = {}
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        ext = item.strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = "." + ext
+        seen.setdefault(ext, None)
+    return tuple(seen)
+
+
+def _matches_skip_extension(filename: str, skip_exts: tuple[str, ...]) -> bool:
+    """True if `filename` ends with one of `skip_exts` (case-insensitive).
+
+    Requires a non-empty stem before the extension, so a file literally named
+    ".log" is NOT matched by the ".log" rule (it has no base name), while
+    "app.log" is. The leading dot on each suffix keeps "catalog" from matching
+    ".log", and matching the full suffix supports compound forms (".min.js").
+    """
+    lower = filename.lower()
+    return any(len(lower) > len(ext) and lower.endswith(ext) for ext in skip_exts)
 
 
 def load_baseline(channel: str) -> dict:
@@ -484,7 +521,35 @@ class Chunk:
         return banner + "".join(self.content_lines)
 
 
-def expand_paths(paths: list[Path]) -> list[Path]:
+def _walk_directory(directory: Path, skip_extensions: tuple[str, ...]) -> tuple[list[Path], int]:
+    """Walk one directory recursively → (sorted files kept, count skipped by ext).
+
+    Applies the same rules as expand_paths: EXCLUDED_FILENAMES and symlinks are
+    always dropped; files whose name matches `skip_extensions` are dropped and
+    counted.
+    """
+    files_in_dir: list[Path] = []
+    skipped = 0
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        dirnames.sort()
+        for fname in sorted(filenames):
+            if fname in EXCLUDED_FILENAMES:
+                continue
+            if _matches_skip_extension(fname, skip_extensions):
+                skipped += 1
+                continue
+            fpath = Path(dirpath) / fname
+            if fpath.is_symlink():
+                continue
+            files_in_dir.append(fpath)
+    files_in_dir.sort()
+    return files_in_dir, skipped
+
+
+def expand_paths(
+    paths: list[Path],
+    skip_extensions: tuple[str, ...] = (),
+) -> list[Path]:
     """Expand any directory entries in `paths` into their contained files.
 
     Files are returned as-is, preserving the order in which they appear in
@@ -497,24 +562,24 @@ def expand_paths(paths: list[Path]) -> list[Path]:
     Symlinks are skipped during expansion to dodge cycles, and filenames in
     EXCLUDED_FILENAMES (e.g. .DS_Store) are always dropped. A non-existent
     path passed directly is left in the list so read_records() can warn about it.
+
+    `skip_extensions` (from config; already normalized) drops matching files
+    during expansion ONLY — a file passed explicitly on the command line is
+    always kept, even if its extension is on the skip list. The count of files
+    skipped this way is reported to stderr.
     """
     result: list[Path] = []
+    skipped_count = 0
     for p in paths:
         if p.is_dir() and not p.is_symlink():
-            files_in_dir: list[Path] = []
-            for dirpath, dirnames, filenames in os.walk(p, followlinks=False):
-                dirnames.sort()
-                for fname in sorted(filenames):
-                    if fname in EXCLUDED_FILENAMES:
-                        continue
-                    fpath = Path(dirpath) / fname
-                    if fpath.is_symlink():
-                        continue
-                    files_in_dir.append(fpath)
-            files_in_dir.sort()
+            files_in_dir, skipped = _walk_directory(p, skip_extensions)
             result.extend(files_in_dir)
+            skipped_count += skipped
         else:
             result.append(p)
+    if skipped_count:
+        print(f"  ⚠️  Skipped {skipped_count} file(s) by extension "
+              f"({', '.join(skip_extensions)})", file=sys.stderr)
     return result
 
 
@@ -880,7 +945,10 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    files = expand_paths(args.files)
+    config = load_config()
+    skip_extensions = normalize_skip_extensions(config.get("skip_extensions", []))
+
+    files = expand_paths(args.files, skip_extensions=skip_extensions)
     if not files:
         print("No files to merge (after expanding any folder arguments).", file=sys.stderr)
         return 1
@@ -893,7 +961,7 @@ def main() -> int:
         max_lines=args.max_lines,
         no_banners=args.no_banners,
         track=args.track,
-        config=load_config(),
+        config=config,
     )
 
     if written is None:

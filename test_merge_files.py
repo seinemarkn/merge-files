@@ -86,7 +86,7 @@ class TestDisplayPathFor(unittest.TestCase):
     def test_user_example_from_request(self):
         """The motivating example: keep `<dir-before-app>/app/...`."""
         result = merge_files.display_path_for(Path(
-            "/Users/mark.a.nichols/Documents/Projects/Checkers/checkers/app/view/foo.py"
+            "/Users/x/Documents/Projects/Checkers/checkers/app/view/foo.py"
         ))
         self.assertEqual(result, Path("checkers/app/view/foo.py"))
 
@@ -1347,6 +1347,136 @@ class TestTrackMergeEndToEnd(_TrackMergeBase):
         self._run()                       # merges the change, advances baseline
         result = self._run()              # nothing new now
         self.assertEqual(result, [])
+
+
+class TestNormalizeSkipExtensions(unittest.TestCase):
+    """`normalize_skip_extensions` — config value → match-suffix tuple."""
+
+    def test_adds_leading_dot(self):
+        self.assertEqual(merge_files.normalize_skip_extensions(["log"]), (".log",))
+
+    def test_keeps_existing_dot(self):
+        self.assertEqual(merge_files.normalize_skip_extensions([".log"]), (".log",))
+
+    def test_lowercases_and_trims(self):
+        self.assertEqual(
+            merge_files.normalize_skip_extensions(["  .LOG ", "TMP"]),
+            (".log", ".tmp"),
+        )
+
+    def test_drops_blanks_and_non_strings(self):
+        self.assertEqual(
+            merge_files.normalize_skip_extensions(["", "  ", 5, None, ".log"]),
+            (".log",),
+        )
+
+    def test_dedups_preserving_order(self):
+        self.assertEqual(
+            merge_files.normalize_skip_extensions([".log", "log", ".tmp"]),
+            (".log", ".tmp"),
+        )
+
+    def test_non_list_returns_empty(self):
+        self.assertEqual(merge_files.normalize_skip_extensions(".log"), ())
+        self.assertEqual(merge_files.normalize_skip_extensions(None), ())
+
+
+class TestMatchesSkipExtension(unittest.TestCase):
+    """`_matches_skip_extension` — the per-file suffix test."""
+
+    def test_simple_extension_matches(self):
+        self.assertTrue(merge_files._matches_skip_extension("app.log", (".log",)))
+
+    def test_case_insensitive(self):
+        self.assertTrue(merge_files._matches_skip_extension("APP.LOG", (".log",)))
+
+    def test_compound_extension_matches(self):
+        self.assertTrue(
+            merge_files._matches_skip_extension("bundle.min.js", (".min.js",))
+        )
+        # A plain .js rule should NOT be fooled into skipping only by ".min.js";
+        # but .js does legitimately match bundle.min.js (it ends with .js).
+        self.assertTrue(merge_files._matches_skip_extension("bundle.min.js", (".js",)))
+
+    def test_substring_is_not_a_match(self):
+        """'catalog' must not match the '.log' rule."""
+        self.assertFalse(merge_files._matches_skip_extension("catalog", (".log",)))
+
+    def test_bare_dotfile_with_no_stem_is_not_matched(self):
+        """A file literally named '.log' has no base name → not skipped."""
+        self.assertFalse(merge_files._matches_skip_extension(".log", (".log",)))
+
+    def test_no_match_for_other_extension(self):
+        self.assertFalse(merge_files._matches_skip_extension("a.py", (".log", ".tmp")))
+
+    def test_empty_skip_list_never_matches(self):
+        self.assertFalse(merge_files._matches_skip_extension("a.log", ()))
+
+
+class TestExpandPathsSkipExtensions(unittest.TestCase):
+    """Extension skipping during directory expansion."""
+
+    def setUp(self):
+        self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def _touch(self, rel: str) -> Path:
+        path = self.tmpdir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n", encoding="utf-8")
+        return path
+
+    def test_skips_matching_extension_in_directory(self):
+        d = self.tmpdir / "proj"
+        d.mkdir()
+        keep = self._touch("proj/keep.py")
+        self._touch("proj/debug.log")
+        with redirect_stderr(io.StringIO()):
+            result = merge_files.expand_paths([d], skip_extensions=(".log",))
+        self.assertEqual(result, [keep])
+
+    def test_skips_recursively(self):
+        d = self.tmpdir / "proj"
+        d.mkdir()
+        keep = self._touch("proj/src/main.py")
+        self._touch("proj/src/trace.log")
+        with redirect_stderr(io.StringIO()):
+            result = merge_files.expand_paths([d], skip_extensions=(".log",))
+        self.assertEqual(result, [keep])
+
+    def test_explicitly_named_file_is_never_skipped(self):
+        """A skip extension only applies to directory expansion — a file passed
+        directly is always kept."""
+        f = self._touch("standalone.log")
+        result = merge_files.expand_paths([f], skip_extensions=(".log",))
+        self.assertEqual(result, [f])
+
+    def test_no_skip_extensions_is_prior_behavior(self):
+        d = self.tmpdir / "proj"
+        d.mkdir()
+        py = self._touch("proj/a.py")
+        log = self._touch("proj/b.log")
+        self.assertEqual(set(merge_files.expand_paths([d])), {py, log})
+
+    def test_skip_count_reported_to_stderr(self):
+        d = self.tmpdir / "proj"
+        d.mkdir()
+        self._touch("proj/keep.py")
+        self._touch("proj/a.log")
+        self._touch("proj/b.log")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            merge_files.expand_paths([d], skip_extensions=(".log",))
+        self.assertIn("Skipped 2 file(s) by extension", err.getvalue())
+
+    def test_multiple_extensions(self):
+        d = self.tmpdir / "proj"
+        d.mkdir()
+        keep = self._touch("proj/keep.py")
+        self._touch("proj/a.log")
+        self._touch("proj/b.tmp")
+        with redirect_stderr(io.StringIO()):
+            result = merge_files.expand_paths([d], skip_extensions=(".log", ".tmp"))
+        self.assertEqual(result, [keep])
 
 
 class TestTrackParseArgs(unittest.TestCase):
