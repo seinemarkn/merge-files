@@ -10,12 +10,15 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import json
+import os
 import re
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 def _load_script():
@@ -1030,6 +1033,350 @@ class TestParseArgs(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 self._parse(["a.py", "--max-lines", "5"])
+
+
+# Deletions-manifest per-path regex (MERGE-FORMAT.md §11, format version 1.1).
+DELETED_PATH_RE = re.compile(r"^=== deleted (.+)$")
+
+
+def _make_record(path: str, content: str, index: int = 1, total: int = 1):
+    """Build a FileRecord the way read_records would (forced trailing \\n, shas)."""
+    text = content if (content == "" or content.endswith("\n")) else content + "\n"
+    lines = text.splitlines(keepends=True)
+    sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    sha_norm = hashlib.sha256((text.strip() + "\n").encode("utf-8")).hexdigest()
+    return merge_files.FileRecord(
+        path=Path(path), index=index, total=total,
+        lines=lines, sha=sha, sha_normalized=sha_norm,
+    )
+
+
+class TestMakeDeletionsSection(unittest.TestCase):
+    """Deletions manifest emitted atop part 1 of a --track run."""
+
+    def test_carries_format_version_and_count(self):
+        section = merge_files.make_deletions_section(["a/x.py", "b/y.py"])
+        lines = section.splitlines()
+        self.assertEqual(lines[0], "=== format-version=1.1")
+        self.assertEqual(lines[1], "=== deleted-files 2")
+
+    def test_one_line_per_deleted_path(self):
+        section = merge_files.make_deletions_section(["a/x.py", "b/y.py", "c/z.py"])
+        paths = [DELETED_PATH_RE.match(ln).group(1)
+                 for ln in section.splitlines() if DELETED_PATH_RE.match(ln)]
+        self.assertEqual(paths, ["a/x.py", "b/y.py", "c/z.py"])
+
+    def test_lines_do_not_collide_with_file_banner_regex(self):
+        """No manifest line matches the file-banner line-1 regex, so existing
+        consumers skip the whole block."""
+        section = merge_files.make_deletions_section(["a/x.py"])
+        for line in section.splitlines():
+            self.assertIsNone(BANNER_LINE1_RE.match(line))
+            self.assertIsNone(MERGE_FILE_HEADER_RE.match(line))
+
+
+class TestSnapshotAndTracking(unittest.TestCase):
+    """`snapshot_from_records` and `apply_tracking` diff logic (no I/O)."""
+
+    def test_snapshot_keys_on_display_path(self):
+        rec = _make_record("/x/y/proj/app/view/foo.py", "code\n")
+        snap = merge_files.snapshot_from_records([rec])
+        self.assertIn("proj/app/view/foo.py", snap)
+        self.assertEqual(snap["proj/app/view/foo.py"]["sha_norm"], rec.sha_normalized)
+
+    def test_new_file_is_changed(self):
+        rec = _make_record("/t/a.py", "a\n")
+        result = merge_files.apply_tracking([rec], baseline_files={})
+        self.assertEqual([r.path for r in result.changed], [Path("/t/a.py")])
+        self.assertEqual(result.deleted, [])
+
+    def test_unchanged_file_is_skipped(self):
+        rec = _make_record("/t/a.py", "a\n")
+        baseline = {"/t/a.py": {"sha_norm": rec.sha_normalized}}
+        result = merge_files.apply_tracking([rec], baseline)
+        self.assertEqual(result.changed, [])
+
+    def test_whitespace_only_change_is_not_a_change(self):
+        """sha-norm is the change key, so reindent/trailing-space churn is
+        ignored."""
+        old = _make_record("/t/a.py", "hello world\n")
+        new = _make_record("/t/a.py", "\n\n  hello world  \n\n")
+        baseline = {"/t/a.py": {"sha_norm": old.sha_normalized}}
+        result = merge_files.apply_tracking([new], baseline)
+        self.assertEqual(result.changed, [])
+
+    def test_content_change_is_detected(self):
+        new = _make_record("/t/a.py", "different\n")
+        baseline = {"/t/a.py": {"sha_norm": "0" * 64}}
+        result = merge_files.apply_tracking([new], baseline)
+        self.assertEqual(len(result.changed), 1)
+
+    def test_deleted_file_reported(self):
+        rec = _make_record("/t/a.py", "a\n")
+        baseline = {"/t/a.py": {"sha_norm": rec.sha_normalized},
+                    "/t/gone.py": {"sha_norm": "1" * 64}}
+        result = merge_files.apply_tracking([rec], baseline)
+        self.assertEqual(result.changed, [])
+        self.assertEqual(result.deleted, ["/t/gone.py"])
+
+    def test_changed_records_are_renumbered_gap_free(self):
+        """Only-changed subset gets a fresh 1..K [N/M] numbering."""
+        a = _make_record("/t/a.py", "a\n", index=1, total=3)
+        b = _make_record("/t/b.py", "b-new\n", index=2, total=3)
+        c = _make_record("/t/c.py", "c\n", index=3, total=3)
+        baseline = {
+            "/t/a.py": {"sha_norm": a.sha_normalized},   # unchanged
+            "/t/b.py": {"sha_norm": "9" * 64},           # changed
+            "/t/c.py": {"sha_norm": c.sha_normalized},   # unchanged
+        }
+        result = merge_files.apply_tracking([a, b, c], baseline)
+        self.assertEqual([(r.index, r.total) for r in result.changed], [(1, 1)])
+        self.assertEqual(result.changed[0].path, Path("/t/b.py"))
+
+    def test_snapshot_covers_full_batch_not_just_changed(self):
+        a = _make_record("/t/a.py", "a\n")
+        b = _make_record("/t/b.py", "b\n")
+        baseline = {"/t/a.py": {"sha_norm": a.sha_normalized}}  # a unchanged, b new
+        result = merge_files.apply_tracking([a, b], baseline)
+        self.assertEqual(set(result.snapshot), {"/t/a.py", "/t/b.py"})
+
+
+class TestConfigAndBaselineIO(unittest.TestCase):
+    """Config loading + baseline persistence, isolated via XDG_* temp dirs."""
+
+    def setUp(self):
+        self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(self.tmpdir / "state"),
+            "XDG_CONFIG_HOME": str(self.tmpdir / "config"),
+        }))
+
+    def _write_config(self, text: str):
+        path = merge_files.config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_config_paths_honor_xdg(self):
+        self.assertEqual(
+            merge_files.config_path(),
+            self.tmpdir / "config" / "merge-files" / "config.json",
+        )
+        self.assertEqual(
+            merge_files.baseline_path("chan"),
+            self.tmpdir / "state" / "merge-files" / "baselines" / "chan.json",
+        )
+
+    def test_missing_config_returns_defaults_silently(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            config = merge_files.load_config()
+        self.assertEqual(config["advance"], "optimistic")
+        self.assertTrue(config["report_deletions"])
+        self.assertEqual(config["skip_extensions"], [])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_config_overlays_onto_defaults(self):
+        self._write_config('{"report_deletions": false, "skip_extensions": [".log"]}')
+        config = merge_files.load_config()
+        self.assertFalse(config["report_deletions"])
+        self.assertEqual(config["skip_extensions"], [".log"])
+        # Untouched keys keep their defaults.
+        self.assertEqual(config["advance"], "optimistic")
+
+    def test_invalid_config_json_warns_and_uses_defaults(self):
+        self._write_config("{not valid json")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            config = merge_files.load_config()
+        self.assertTrue(config["report_deletions"])
+        self.assertIn("Invalid config JSON", err.getvalue())
+
+    def test_missing_baseline_is_empty(self):
+        self.assertEqual(merge_files.load_baseline("nope"), {})
+
+    def test_corrupt_baseline_warns_and_treats_all_new(self):
+        path = merge_files.baseline_path("chan")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{broken", encoding="utf-8")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            result = merge_files.load_baseline("chan")
+        self.assertEqual(result, {})
+        self.assertIn("Corrupt baseline", err.getvalue())
+
+    def test_save_and_load_baseline_round_trips(self):
+        snapshot = {"a/x.py": {"sha_norm": "a" * 64, "sha": "b" * 64, "lines": 3}}
+        merge_files.save_baseline("chan", snapshot)
+        self.assertEqual(merge_files.load_baseline("chan"), snapshot)
+
+    def test_save_baseline_preserves_created_timestamp(self):
+        merge_files.save_baseline("chan", {"a": {"sha_norm": "a" * 64}})
+        first = json.loads(merge_files.baseline_path("chan").read_text())
+        merge_files.save_baseline("chan", {"b": {"sha_norm": "b" * 64}})
+        second = json.loads(merge_files.baseline_path("chan").read_text())
+        self.assertEqual(first["created"], second["created"])
+
+    def test_save_baseline_is_atomic_no_tmp_left_behind(self):
+        merge_files.save_baseline("chan", {"a": {"sha_norm": "a" * 64}})
+        tmp = merge_files.baseline_path("chan").with_name("chan.json.tmp")
+        self.assertFalse(tmp.exists())
+
+
+class _TrackMergeBase(unittest.TestCase):
+    """End-to-end --track scaffolding with XDG-isolated state/config."""
+
+    def setUp(self):
+        self.tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(self.tmpdir / "state"),
+            "XDG_CONFIG_HOME": str(self.tmpdir / "config"),
+        }))
+        self.tree = self.tmpdir / "tree"
+        self.tree.mkdir()
+        self.output = self.tmpdir / "out.txt"
+
+    def _write(self, rel: str, content: str) -> Path:
+        path = self.tree / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _rm(self, rel: str):
+        (self.tree / rel).unlink()
+
+    def _run(self, channel="demo", max_lines=100, config=None):
+        files = merge_files.expand_paths([self.tree])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return merge_files.merge(
+                files=files, output_base=self.output,
+                max_lines=max_lines, track=channel, config=config,
+            )
+
+    def _out_text(self, paths) -> str:
+        return "".join(p.read_text(encoding="utf-8") for p in paths)
+
+
+class TestTrackMergeEndToEnd(_TrackMergeBase):
+    """The change-only merge behavior of --track, wired through merge()."""
+
+    def test_first_run_merges_everything_and_writes_baseline(self):
+        self._write("a.txt", "alpha\n")
+        self._write("b.txt", "beta\n")
+        paths = self._run()
+        text = self._out_text(paths)
+        self.assertIn("alpha", text)
+        self.assertIn("beta", text)
+        # Baseline now exists with both files.
+        baseline = merge_files.load_baseline("demo")
+        self.assertEqual(len(baseline), 2)
+
+    def test_second_run_with_no_changes_writes_nothing(self):
+        self._write("a.txt", "alpha\n")
+        self._run()
+        self.output.unlink()  # remove first output so we can detect a re-write
+        result = self._run()
+        self.assertEqual(result, [])            # success, nothing written
+        self.assertFalse(self.output.exists())  # no output file produced
+
+    def test_only_changed_file_is_merged(self):
+        self._write("a.txt", "alpha\n")
+        self._write("b.txt", "beta\n")
+        self._run()
+        self._write("b.txt", "beta CHANGED\n")
+        paths = self._run()
+        text = self._out_text(paths)
+        self.assertIn("beta CHANGED", text)
+        self.assertNotIn("alpha", text)  # a.txt unchanged → excluded
+        self.assertIn("[1/1]", text)     # renumbered to a one-file batch
+
+    def test_new_file_is_included_on_later_run(self):
+        self._write("a.txt", "alpha\n")
+        self._run()
+        self._write("c.txt", "gamma\n")
+        paths = self._run()
+        self.assertIn("gamma", self._out_text(paths))
+
+    def test_deletion_recorded_in_output_and_baseline(self):
+        self._write("a.txt", "alpha\n")
+        self._write("b.txt", "beta\n")
+        self._run()
+        self._rm("b.txt")
+        self._write("a.txt", "alpha CHANGED\n")  # a change so there's content too
+        paths = self._run()
+        text = self._out_text(paths)
+        self.assertIn("=== deleted-files 1", text)
+        self.assertRegex(text, r"=== deleted .*b\.txt")
+        # Deleted file is gone from the advanced baseline.
+        self.assertNotIn(str(merge_files.display_path_for(self.tree / "b.txt")),
+                         merge_files.load_baseline("demo"))
+
+    def test_deletions_only_run_produces_manifest_file(self):
+        """A run whose sole change is a deletion still writes one merge file
+        carrying the manifest, so the consumer learns of the removal."""
+        self._write("a.txt", "alpha\n")
+        self._run()
+        self._rm("a.txt")
+        paths = self._run()
+        self.assertEqual(len(paths), 1)
+        text = self._out_text(paths)
+        self.assertIn("=== deleted-files 1", text)
+        self.assertIn("=== format-version=1.1", text)
+
+    def test_report_deletions_false_suppresses_manifest(self):
+        self._write("a.txt", "alpha\n")
+        self._write("b.txt", "beta\n")
+        self._run()
+        self._rm("b.txt")
+        self._write("a.txt", "alpha CHANGED\n")
+        paths = self._run(config={"report_deletions": False})
+        self.assertNotIn("deleted", self._out_text(paths))
+
+    def test_no_deletions_output_is_plain_v1_format(self):
+        """A change-only run with no deletions emits no 1.1 marker — it's
+        byte-for-byte a normal merge."""
+        self._write("a.txt", "alpha\n")
+        self._run()
+        self._write("a.txt", "alpha CHANGED\n")
+        paths = self._run()
+        self.assertNotIn("format-version", self._out_text(paths))
+
+    def test_baseline_advances_so_change_not_remerged(self):
+        self._write("a.txt", "alpha\n")
+        self._run()
+        self._write("a.txt", "alpha CHANGED\n")
+        self._run()                       # merges the change, advances baseline
+        result = self._run()              # nothing new now
+        self.assertEqual(result, [])
+
+
+class TestTrackParseArgs(unittest.TestCase):
+    """--track argument parsing and validation."""
+
+    def _parse(self, argv):
+        saved = sys.argv
+        try:
+            sys.argv = ["merge-files.py"] + argv
+            return merge_files.parse_args()
+        finally:
+            sys.argv = saved
+
+    def test_track_name_accepted(self):
+        ns = self._parse(["a.py", "--track", "checkers-prod"])
+        self.assertEqual(ns.track, "checkers-prod")
+
+    def test_track_defaults_to_none(self):
+        ns = self._parse(["a.py"])
+        self.assertIsNone(ns.track)
+
+    def test_track_with_no_banners_is_rejected(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self._parse(["a.py", "--track", "x", "--no-banners"])
+
+    def test_invalid_track_name_is_rejected(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self._parse(["a.py", "--track", "../escape"])
 
 
 if __name__ == "__main__":

@@ -19,6 +19,12 @@ on open theFiles
 
 	-- Build the argv string of dropped files. Each path is shell-quoted so
 	-- spaces and special characters survive.
+	--
+	-- DELIBERATELY no flags are added here. Change-tracking (--track) is a
+	-- CLI-only feature: it keeps persistent per-channel baselines and is not
+	-- something a casual drag-and-drop should ever trigger. Do NOT add --track
+	-- (or other stateful flags) to this droplet — keep drag-and-drop a plain,
+	-- one-shot, stateless merge.
 	set fileArgs to ""
 	repeat with f in theFiles
 		set fileArgs to fileArgs & " " & quoted form of (POSIX path of f)

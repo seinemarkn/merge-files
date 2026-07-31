@@ -8,6 +8,7 @@ Usage:
     python merge-files.py src/ -o all_python.txt
     python merge-files.py --max-lines 2000 *.py
     python merge-files.py a.md b.md c.md --no-banners
+    python merge-files.py src/ --track myproj   # merge only files changed since last run
 
 Directory arguments are expanded recursively into their contained files
 (sorted alphabetically by path). Hidden entries (dot-prefixed) ARE included
@@ -26,10 +27,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
+import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -68,6 +71,234 @@ EXCLUDED_FILENAMES = frozenset({".DS_Store"})
 # layouts come up. Beware of common names like 'src' or 'lib': they appear
 # in many unrelated paths and would over-trigger trimming.
 DISPLAY_PATH_ANCHORS = ("app",)
+
+# ---------------------------------------------------------------------------
+# Configuration & change-tracking (the --track feature).
+#
+# Two distinct on-disk locations, following the XDG split:
+#   - CONFIG  (~/.config/merge-files/config.json): user-editable settings.
+#   - STATE   (~/.local/state/merge-files/baselines/<channel>.json): the
+#     machine-generated per-channel baselines. Never hand-edited.
+# Both honor their XDG_* env overrides. Neither ever touches source files
+# or merge outputs, so tracking is entirely non-destructive.
+# ---------------------------------------------------------------------------
+
+# Config schema version. Bumped only on a breaking change to the shape below.
+CONFIG_VERSION = 1
+
+# Defaults used when the config file is absent or a key is omitted. A future
+# skip-by-extension feature will read `skip_extensions` from here — the key is
+# present (and documented) now so the file shape stays stable, but it is not
+# yet enforced during expansion.
+DEFAULT_CONFIG: dict = {
+    "config_version": CONFIG_VERSION,
+    # How the local baseline advances after a successful --track run. Only
+    # "optimistic" (advance every run) is implemented today; the key exists so
+    # the policy can change later without a new flag.
+    "advance": "optimistic",
+    # Record deleted files (present in the baseline, gone from the tree) in the
+    # merge output's deletions section. Informational for the consumer only;
+    # set false to omit the section entirely.
+    "report_deletions": True,
+    # RESERVED (not yet enforced): file extensions to skip during folder
+    # expansion, e.g. [".log", ".min.js"]. Leading dot, matched case-insensitively.
+    "skip_extensions": [],
+}
+
+# Baseline manifest schema version, independent of CONFIG_VERSION.
+BASELINE_VERSION = 1
+
+# Deletions manifest bumps the merge-format version (MERGE-FORMAT.md §10). The
+# marker line only appears when a track run actually has deletions, so a track
+# merge with no deletions is byte-identical to a plain (1.0) merge.
+DELETIONS_FORMAT_VERSION = "1.1"
+
+# Channel names become filenames under the baselines dir, so keep them to a
+# safe, predictable character set (no path separators, no leading dot/dash).
+CHANNEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _xdg_dir(env_var: str, default_parts: tuple[str, ...]) -> Path:
+    """Resolve an XDG base dir (honoring its env override) + the tool subdir."""
+    override = os.environ.get(env_var)
+    base = Path(override) if override else Path.home().joinpath(*default_parts)
+    return base / "merge-files"
+
+
+def config_path() -> Path:
+    """Path to the user config file (~/.config/merge-files/config.json)."""
+    return _xdg_dir("XDG_CONFIG_HOME", (".config",)) / "config.json"
+
+
+def baseline_path(channel: str) -> Path:
+    """Path to a channel's baseline manifest under the state dir."""
+    return _xdg_dir("XDG_STATE_HOME", (".local", "state")) / "baselines" / f"{channel}.json"
+
+
+def load_config() -> dict:
+    """Return config settings, overlaying config.json onto DEFAULT_CONFIG.
+
+    A missing file, an unreadable file, or invalid JSON all fall back to the
+    defaults (with a stderr warning for the latter two — a truly-absent file is
+    the normal case and stays silent). Unknown keys are kept so forward-compat
+    settings survive a round-trip, but only the documented keys are consulted.
+    """
+    config = dict(DEFAULT_CONFIG)
+    path = config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return config
+    except OSError as err:
+        print(f"  ⚠️  Could not read config ({path}): {err}; using defaults",
+              file=sys.stderr)
+        return config
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as err:
+        print(f"  ⚠️  Invalid config JSON ({path}): {err}; using defaults",
+              file=sys.stderr)
+        return config
+    if isinstance(data, dict):
+        config.update(data)
+    else:
+        print(f"  ⚠️  Config ({path}) is not a JSON object; using defaults",
+              file=sys.stderr)
+    return config
+
+
+def load_baseline(channel: str) -> dict:
+    """Return a channel's baseline file-map ({display_path: {...}}), or {}.
+
+    A missing baseline (first run on a channel) returns an empty map. A corrupt
+    or unreadable baseline warns and returns empty — treating every file as new
+    is a safe, recoverable failure mode (the run just re-merges everything and
+    rewrites a clean baseline).
+    """
+    path = baseline_path(channel)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        print(f"  ⚠️  Could not read baseline for '{channel}' ({path}): {err}; "
+              f"treating all files as new", file=sys.stderr)
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as err:
+        print(f"  ⚠️  Corrupt baseline for '{channel}' ({path}): {err}; "
+              f"treating all files as new", file=sys.stderr)
+        return {}
+    files = data.get("files") if isinstance(data, dict) else None
+    return files if isinstance(files, dict) else {}
+
+
+def save_baseline(channel: str, snapshot: dict) -> None:
+    """Atomically write a channel's baseline (full current snapshot).
+
+    Writes to a temp file then os.replace()s it into place so an interrupted
+    run can never leave a half-written (corrupt) baseline. The original
+    `created` timestamp is preserved across updates when the file already exists.
+    """
+    path = baseline_path(channel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    created = now
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(prev, dict) and isinstance(prev.get("created"), str):
+            created = prev["created"]
+    except (OSError, json.JSONDecodeError):
+        pass
+    payload = {
+        "baseline_version": BASELINE_VERSION,
+        "channel": channel,
+        "created": created,
+        "updated": now,
+        "files": snapshot,
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def snapshot_from_records(records: list[FileRecord]) -> dict:
+    """Build a {display_path: {sha_norm, sha, lines}} map for the whole batch.
+
+    The key is the *display path* (the trimmed banner path) — chosen for
+    portability across machines/checkout locations. Display paths are not
+    guaranteed unique (see display_path_for); a collision warns and last-wins,
+    which at worst under-reports one file as changed on the next run.
+    """
+    snapshot: dict = {}
+    for rec in records:
+        key = str(display_path_for(rec.path))
+        if key in snapshot:
+            print(f"  ⚠️  Display-path collision on '{key}'; change tracking "
+                  f"may be imprecise for it", file=sys.stderr)
+        snapshot[key] = {
+            "sha_norm": rec.sha_normalized,
+            "sha": rec.sha,
+            "lines": len(rec.lines),
+        }
+    return snapshot
+
+
+@dataclass
+class TrackingResult:
+    """Outcome of diffing the current batch against a channel's baseline.
+
+    `changed` is the renumbered subset of records to actually merge (new or
+    content-changed by sha-norm). `deleted` is the sorted list of display paths
+    that were in the baseline but are gone now. `snapshot` is the FULL current
+    snapshot to persist as the next baseline (not just the changed subset).
+    """
+    changed: list[FileRecord]
+    deleted: list[str]
+    snapshot: dict
+
+
+def apply_tracking(records: list[FileRecord], baseline_files: dict) -> TrackingResult:
+    """Diff `records` against a baseline file-map, keyed by display path.
+
+    A record is kept when its display path is new to the baseline OR its
+    sha-norm differs from the stored one (whitespace-only churn is ignored,
+    since sha-norm normalizes it). Kept records are renumbered 1..K so their
+    banners show a gap-free [N/M] over the changed set only.
+    """
+    snapshot = snapshot_from_records(records)
+    changed: list[FileRecord] = []
+    for rec in records:
+        key = str(display_path_for(rec.path))
+        prev = baseline_files.get(key)
+        if not isinstance(prev, dict) or prev.get("sha_norm") != rec.sha_normalized:
+            changed.append(rec)
+    total = len(changed)
+    renumbered = [replace(rec, index=i, total=total)
+                  for i, rec in enumerate(changed, start=1)]
+    deleted = sorted(set(baseline_files) - set(snapshot))
+    return TrackingResult(changed=renumbered, deleted=deleted, snapshot=snapshot)
+
+
+def make_deletions_section(deleted: list[str]) -> str:
+    """Return the deletions manifest that leads part 1 of a track merge.
+
+    Shape (only emitted when `deleted` is non-empty):
+        === format-version=1.1
+        === deleted-files N
+        === deleted <display_path>
+        ...
+    Every line starts `=== ` but none contains `[`, so existing consumers
+    (which scan for the `=== [N/M]` banner) skip the whole block harmlessly.
+    """
+    lines = [
+        f"=== format-version={DELETIONS_FORMAT_VERSION}\n",
+        f"=== deleted-files {len(deleted)}\n",
+    ]
+    lines.extend(f"=== deleted {p}\n" for p in deleted)
+    return "".join(lines)
 
 
 def is_likely_binary(data: bytes, sample_size: int = 8192) -> bool:
@@ -418,60 +649,144 @@ def output_paths(base: Path, count: int) -> list[Path]:
     ]
 
 
+def _write_plan(
+    plan: list[list[Chunk]],
+    output_base: Path,
+    deletions_block: str = "",
+) -> list[Path]:
+    """Write each planned merge file to disk and return the paths written.
+
+    `deletions_block`, when non-empty, is emitted once, immediately after the
+    merge-file header of part 1 (the deletions manifest of a --track run).
+    """
+    paths = output_paths(output_base, len(plan))
+    total_merge_files = len(plan)
+    for part_n, (path, chunks) in enumerate(zip(paths, plan), start=1):
+        lead = deletions_block if part_n == 1 else ""
+        with path.open("w", encoding="utf-8") as out:
+            out.write(make_merge_file_header(part_n, total_merge_files))
+            if lead:
+                out.write(lead)
+            for chunk in chunks:
+                out.write(chunk.render())
+        used = (MERGE_FILE_HEADER_LINES + lead.count("\n")
+                + sum(c.total_lines for c in chunks))
+        n_split = sum(1 for c in chunks if c.is_split)
+        marker = f", {n_split} split chunk(s)" if n_split else ""
+        print(f"  ✓ {path.name} — {used:,} lines, {len(chunks)} chunk(s){marker}")
+    return paths
+
+
+def _write_no_banners(records: list[FileRecord], output_base: Path,
+                      input_count: int) -> list[Path]:
+    """Write the single, metadata-free output for --no-banners mode."""
+    with output_base.open("w", encoding="utf-8") as out:
+        for rec in records:
+            out.writelines(rec.lines)
+    total_lines = sum(len(r.lines) for r in records)
+    print(f"\n✅ Merged {len(records)}/{input_count} file(s), "
+          f"{total_lines:,} content lines (no banners)")
+    print(f"   Output: {output_base}")
+    return [output_base]
+
+
+def _tracked_batch(records: list[FileRecord], track: str,
+                   config: dict) -> tuple[list[FileRecord], list[str], dict]:
+    """Diff `records` against channel `track`'s baseline → (changed, deleted, snapshot)."""
+    result = apply_tracking(records, load_baseline(track))
+    deleted = result.deleted if config.get("report_deletions", True) else []
+    return result.changed, deleted, result.snapshot
+
+
+def _plan_output(merged_records: list[FileRecord], deletions_block: str,
+                 max_lines: int) -> list[list[Chunk]] | None:
+    """Bin-pack the records to merge, reserving header + deletions overhead.
+
+    Returns the plan, [[]] for a deletions-only run (which still needs one
+    merge file to host the manifest), or None if the deletions manifest is too
+    large to leave room for content at the given cap.
+    """
+    if not merged_records:
+        return [[]]
+    # The deletions block is reserved batch-wide for simplicity; on a multi-part
+    # split that wastes a few lines on parts 2..Q, negligible for realistic lists.
+    cap = max_lines - MERGE_FILE_HEADER_LINES - deletions_block.count("\n")
+    if cap <= BANNER_LINES:
+        n_deleted = max(deletions_block.count("\n") - 2, 0)
+        print(f"\n⚠️  --max-lines={max_lines} is too small to hold the "
+              f"{n_deleted}-entry deletions manifest plus file content; "
+              f"raise --max-lines.", file=sys.stderr)
+        return None
+    return plan_chunks(merged_records, cap=cap)
+
+
+def _print_merge_summary(track: str | None, records: list[FileRecord],
+                         merged_records: list[FileRecord], deleted: list[str],
+                         paths: list[Path], input_count: int, max_lines: int) -> None:
+    """Print the final one-line summary (track-aware)."""
+    if track is None:
+        print(f"\n✅ Merged {len(merged_records)}/{input_count} file(s) into "
+              f"{len(paths)} merge file(s) (cap {max_lines:,} lines)")
+        return
+    bits = [f"{len(merged_records)} changed/new"]
+    if deleted:
+        bits.append(f"{len(deleted)} deleted")
+    bits.append(f"{len(records) - len(merged_records)} unchanged")
+    print(f"\n✅ Channel '{track}': " + ", ".join(bits)
+          + f" → {len(paths)} merge file(s) (cap {max_lines:,} lines)")
+
+
 def merge(
     files: list[Path],
     output_base: Path,
     max_lines: int = DEFAULT_MAX_LINES,
     no_banners: bool = False,
-) -> list[Path]:
+    track: str | None = None,
+    config: dict | None = None,
+) -> list[Path] | None:
     """Read input files, plan chunks, write one or more merge files.
 
-    Returns the list of output paths actually written. Single-output runs
-    return a one-element list using `output_base` unchanged.
+    Returns the list of output paths written. Returns None on hard failure
+    (nothing readable to act on), and an empty list on a --track run that found
+    no changes and no deletions (a success — nothing to write).
 
-    `--no-banners` mode forces a single output file with no banners and
-    no splitting — splits without banners can't be reassembled, so the cap
-    is ignored in that mode.
+    `--no-banners` mode forces a single output file with no banners and no
+    splitting — splits without banners can't be reassembled, so the cap is
+    ignored in that mode. (`--track` is rejected alongside `--no-banners`.)
+
+    `--track NAME` diffs the batch against channel NAME's local baseline and
+    merges only new/changed files, records deletions in a manifest atop part 1,
+    then advances the baseline to the full current snapshot.
     """
+    config = config if config is not None else DEFAULT_CONFIG
     records = read_records(files)
-    if not records:
+    if not records and track is None:
         print("\n⚠️  No files successfully read.", file=sys.stderr)
-        return []
-
-    input_count = len(files)
-    merged_count = len(records)
+        return None
 
     if no_banners:
-        with output_base.open("w", encoding="utf-8") as out:
-            for rec in records:
-                out.writelines(rec.lines)
-        total_lines = sum(len(r.lines) for r in records)
-        print(f"\n✅ Merged {merged_count}/{input_count} file(s), "
-              f"{total_lines:,} content lines (no banners)")
-        print(f"   Output: {output_base}")
-        return [output_base]
+        return _write_no_banners(records, output_base, len(files))
 
-    # Reserve MERGE_FILE_HEADER_LINES per merge file. The bin-packer sees a
-    # cap reduced by that overhead so total banner+content+header stays at
-    # or below `max_lines` regardless of how many merge files get produced.
-    plan = plan_chunks(records, cap=max_lines - MERGE_FILE_HEADER_LINES)
-    paths = output_paths(output_base, len(plan))
-    total_merge_files = len(plan)
+    if track is not None:
+        merged_records, deleted, snapshot = _tracked_batch(records, track, config)
+        if not merged_records and not deleted:
+            save_baseline(track, snapshot)  # optimistic advance (no-op refresh)
+            print(f"\n✅ No changes on channel '{track}' "
+                  f"({len(records)} file(s) scanned, all unchanged).")
+            return []
+    else:
+        merged_records, deleted, snapshot = records, [], None
 
-    for part_n, (path, chunks) in enumerate(zip(paths, plan), start=1):
-        with path.open("w", encoding="utf-8") as out:
-            out.write(make_merge_file_header(part_n, total_merge_files))
-            for chunk in chunks:
-                out.write(chunk.render())
-        used = MERGE_FILE_HEADER_LINES + sum(c.total_lines for c in chunks)
-        n_split = sum(1 for c in chunks if c.is_split)
-        marker = f", {n_split} split chunk(s)" if n_split else ""
-        print(f"  ✓ {path.name} — {used:,} lines, {len(chunks)} chunk(s){marker}")
+    deletions_block = make_deletions_section(deleted) if deleted else ""
+    plan = _plan_output(merged_records, deletions_block, max_lines)
+    if plan is None:
+        return None
 
-    print(
-        f"\n✅ Merged {merged_count}/{input_count} file(s) into "
-        f"{len(paths)} merge file(s) (cap {max_lines:,} lines)"
-    )
+    paths = _write_plan(plan, output_base, deletions_block)
+    if track is not None:
+        save_baseline(track, snapshot)
+    _print_merge_summary(track, records, merged_records, deleted,
+                         paths, len(files), max_lines)
     return paths
 
 
@@ -522,12 +837,35 @@ def parse_args() -> argparse.Namespace:
             "single output file (splits require banners for reassembly)."
         ),
     )
+    parser.add_argument(
+        "--track",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Change-tracking channel. Only files new or changed (by sha-norm) "
+            "since this channel's last run are merged; deleted files are "
+            "recorded in the output. A per-channel baseline is kept locally "
+            "under ~/.local/state/merge-files/. Incompatible with --no-banners."
+        ),
+    )
     args = parser.parse_args()
     if args.max_lines < MIN_MAX_LINES:
         parser.error(
             f"--max-lines must be >= {MIN_MAX_LINES} "
             f"(got {args.max_lines}); banner overhead leaves no room for content below this."
         )
+    if args.track is not None:
+        if args.no_banners:
+            parser.error(
+                "--track cannot be combined with --no-banners "
+                "(tracking needs banners to record shas and deletions)."
+            )
+        if not CHANNEL_NAME_RE.match(args.track):
+            parser.error(
+                f"--track name {args.track!r} is invalid; use letters, digits, "
+                f"'.', '_' or '-' (must start with a letter or digit)."
+            )
     return args
 
 
@@ -554,10 +892,14 @@ def main() -> int:
         output_base=args.output,
         max_lines=args.max_lines,
         no_banners=args.no_banners,
+        track=args.track,
+        config=load_config(),
     )
 
-    if not written:
+    if written is None:
         return 1
+    if not written:
+        return 0  # --track run with nothing to write is a success, not a failure
 
     if sys.platform == "darwin":
         try:
