@@ -64,8 +64,8 @@ Every banner is **exactly 2 lines**. Two shapes exist:
     - If any path component matches an anchor, the display path starts at
       the directory immediately before the first matching component and
       drops everything to the left. So
-      `/Users/x/Projects/Checkers/checkers/app/view/foo.py` displays as
-      `checkers/app/view/foo.py`.
+      `/Users/x/Projects/MyApp/myapp/app/view/foo.py` displays as
+      `myapp/app/view/foo.py`.
     - If no anchor matches, the display path is the path as the tool saw
       it (unchanged).
   The display path is a label, not a filesystem identifier — two distinct

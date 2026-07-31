@@ -86,9 +86,9 @@ class TestDisplayPathFor(unittest.TestCase):
     def test_user_example_from_request(self):
         """The motivating example: keep `<dir-before-app>/app/...`."""
         result = merge_files.display_path_for(Path(
-            "/Users/x/Documents/Projects/Checkers/checkers/app/view/foo.py"
+            "/Users/x/Documents/Projects/MyApp/myapp/app/view/foo.py"
         ))
-        self.assertEqual(result, Path("checkers/app/view/foo.py"))
+        self.assertEqual(result, Path("myapp/app/view/foo.py"))
 
     def test_no_app_component_returns_path_unchanged(self):
         """If 'app' isn't a path component, the full path is preserved."""
@@ -1491,8 +1491,8 @@ class TestTrackParseArgs(unittest.TestCase):
             sys.argv = saved
 
     def test_track_name_accepted(self):
-        ns = self._parse(["a.py", "--track", "checkers-prod"])
-        self.assertEqual(ns.track, "checkers-prod")
+        ns = self._parse(["a.py", "--track", "myproject-prod"])
+        self.assertEqual(ns.track, "myproject-prod")
 
     def test_track_defaults_to_none(self):
         ns = self._parse(["a.py"])

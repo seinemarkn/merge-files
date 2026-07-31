@@ -11,12 +11,14 @@ an optional macOS drag-and-drop app wrapper.
 
 ## Why
 
-Bundling a tree of source files into a small number of well-labeled text blobs
-is handy for feeding a codebase to an LLM, sharing a snapshot, or archiving.
-`merge-files` makes that deterministic and reversible: every file is banner-
-tagged with its path, line count, and hash, and the split format is specified
-precisely in [MERGE-FORMAT.md](MERGE-FORMAT.md) so a consumer can verify and
-reassemble the originals without reading the source.
+Sometimes you want a whole tree of files collapsed into a small number of
+self-describing text files — to share a snapshot, archive a set of sources,
+review or search them as one document, move them through a text-only channel,
+or feed them to another tool. `merge-files` makes that deterministic and
+reversible: every file is banner-tagged with its path, line count, and hash,
+and the split format is specified precisely in
+[MERGE-FORMAT.md](MERGE-FORMAT.md) so a consumer can verify and reassemble the
+originals without reading the source.
 
 ## Requirements
 

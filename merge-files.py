@@ -376,10 +376,10 @@ def display_path_for(path: Path) -> Path:
     present, the path is returned unchanged.
 
     Examples (with `app` as an anchor):
-      /Users/x/Projects/Checkers/checkers/app/view/foo.py
-        → checkers/app/view/foo.py
-      /Users/x/Projects/Checkers/checkers/README.md   (no anchor)
-        → /Users/x/Projects/Checkers/checkers/README.md
+      /Users/x/Projects/MyApp/myapp/app/view/foo.py
+        → myapp/app/view/foo.py
+      /Users/x/Projects/MyApp/myapp/README.md   (no anchor)
+        → /Users/x/Projects/MyApp/myapp/README.md
       /app/main.py            (anchor at root — no preceding directory)
         → app/main.py
 
